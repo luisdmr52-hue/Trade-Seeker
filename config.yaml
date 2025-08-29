@@ -1,0 +1,72 @@
+## 📄 File 2 — `config.yaml`
+
+```yaml
+symbols:
+  mode: "tier_advisor"                  # "tier_advisor" or "static"
+  static_list: ["BTCUSDT","ETHUSDT","SOLUSDT"]
+  tier_file: "/root/trade-seeker/out/tiers_SAB.txt"
+  tiers: ["S","A","B","C","D"]
+
+rules:
+  enable:
+    pump_spike: true
+    dump_spike: true
+    breakout_up: true
+    breakdown_down: true
+
+  ema_len: 20
+  lookback_bars: 32
+  cooldown_min: 20
+
+  pump_spike:
+    delta_pct: 1.4
+    vol_mult: 2.6
+    min_notional: 80000
+
+  dump_spike:
+    delta_pct: -1.4
+    vol_mult: 2.6
+    min_notional: 80000
+
+  breakout_up:
+    range_lookback: 32
+    buffer_pct: 0.20
+    vol_mult: 2.2
+    ema_confirm: true
+    min_notional: 120000
+
+  breakdown_down:
+    range_lookback: 32
+    buffer_pct: 0.20
+    vol_mult: 2.2
+    ema_confirm: true
+    min_notional: 120000
+
+timeframes:
+  "15m":
+    pump_adjust: {delta_pct: 1.4, vol_mult: 2.6, min_notional: 80000}
+    dump_adjust: {delta_pct: -1.4, vol_mult: 2.6, min_notional: 80000}
+    bo_up_adjust: {vol_mult: 2.2, min_notional: 120000}
+    bo_dn_adjust: {vol_mult: 2.2, min_notional: 120000}
+
+  "30m":
+    pump_adjust: {delta_pct: 2.2, vol_mult: 2.2, min_notional: 120000}
+    dump_adjust: {delta_pct: -2.2, vol_mult: 2.2, min_notional: 120000}
+    bo_up_adjust: {vol_mult: 2.0, min_notional: 150000}
+    bo_dn_adjust: {vol_mult: 2.0, min_notional: 150000}
+
+  "1h":
+    pump_adjust: {delta_pct: 3.2, vol_mult: 2.0, min_notional: 150000}
+    dump_adjust: {delta_pct: -3.2, vol_mult: 2.0, min_notional: 150000}
+    bo_up_adjust: {vol_mult: 1.8, min_notional: 200000}
+    bo_dn_adjust: {vol_mult: 1.8, min_notional: 200000}
+
+telegram:
+  enable: true
+  prefix: "TS"
+  throttle_sec: 2
+
+logging:
+  level: "INFO"
+  to_file: false
+  file_path: "/root/trade-seeker/logs/bot.log"
