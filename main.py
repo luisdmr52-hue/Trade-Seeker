@@ -328,7 +328,7 @@ def run():
     except Exception as e:
         print(f"[BOOT] ping error: {e}", flush=True)
 
-    while True:
+while True:
         try:
             poll_once(syms)
         except KeyboardInterrupt:
