@@ -314,15 +314,19 @@ def poll_once(symbols: List[str]):
 # --------------------------------- Runner -----------------------------------
 
 def run():
-   print("[BOOT] loading config…")
+    print("[BOOT] loading config…")
     load_config(force=True)
     syms = fetch_usdt_symbols()
     tfs = list((cfg("timeframes", {}) or {}).keys())
     print(f"[BOOT] Symbols: {len(syms)} | TFs: {tfs}")
 
-    print("[BOOT] sending startup ping…", flush=True)
-    tg_ping(f"✅ Trade Seeker started | {len(syms)} syms | TFs: {tfs}")
-    tg_send("🟢 TS booted (backup send)")
+    # Startup pings
+    try:
+        print("[BOOT] sending startup ping…", flush=True)
+        tg_ping(f"Trade Seeker started | {len(syms)} syms | TFs: {tfs}")
+        tg_send("TS booted (backup send)")
+    except Exception as e:
+        print(f"[BOOT] ping error: {e}", flush=True)
 
     while True:
         try:
