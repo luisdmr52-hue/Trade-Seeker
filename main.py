@@ -319,6 +319,7 @@ def run():
     syms = fetch_usdt_symbols()
     tfs = list((cfg("timeframes", {}) or {}).keys())
     print(f"[BOOT] Symbols: {len(syms)} | TFs: {tfs}")
+tg_ping(f"✅ Trade Seeker started | {len(syms)} syms | TFs: {tfs}")
 
     while True:
         try:
