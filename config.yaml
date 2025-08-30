@@ -87,3 +87,12 @@ logging:
   level: "INFO"               # INFO, DEBUG, WARN
   to_file: false              # true = also write to file
   file_path: "/root/trade-seeker/logs/bot.log"
+
+symbols:
+  mode: "AUTO_USDT"
+  blacklist:
+    - USDCUSDT
+    - FDUSDUSDT
+    - TUSDUSDT
+    - DAIUSDT
+    - USDPUSDT
