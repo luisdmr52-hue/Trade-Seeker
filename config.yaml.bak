@@ -1,0 +1,98 @@
+# ==============================
+# Trade Seeker — Config
+# ==============================
+
+# Which symbols to scan
+symbols:
+  mode: "tier_advisor"                  # "tier_advisor" = read symbols from Tier file; "static" = use static_list
+  static_list: ["BTCUSDT","ETHUSDT","SOLUSDT"]   # used if mode=static
+  tier_file: "/root/trade-seeker/out/tiers_SAB.txt"   # file path for tier symbols (auto-updated by Tier Advisor)
+  tiers: ["S","A","B","C","D"]          # optional tiers to categorize liquidity
+
+# Detection rules
+rules:
+  enable:
+    pump_spike: true         # sudden upward spike
+    dump_spike: true         # sudden downward spike
+    breakout_up: true        # breaks above recent range with EMA confirmation
+    breakdown_down: true     # breaks below recent range with EMA confirmation
+    ema_cross_up: true       # fast EMA crosses above slow EMA
+    ema_cross_down: true     # fast EMA crosses below slow EMA
+
+  # global rule settings
+  ema_len: 20                # EMA length for breakout confirmation
+  ema_fast_len: 9            # fast EMA length for cross rule
+  ema_slow_len: 20           # slow EMA length for cross rule
+
+  # base rule thresholds (can be adjusted per timeframe below)
+  pump_spike:
+    delta_pct: 1.4           # % price increase vs open
+    vol_mult: 2.6            # multiple of median volume
+    min_notional: 80000      # min USDT traded in the bar
+
+  dump_spike:
+    delta_pct: -1.4          # % price decrease vs open
+    vol_mult: 2.6
+    min_notional: 80000
+
+  breakout_up:
+    range_lookback: 32        # how many candles to measure range
+    buffer_pct: 0.20          # breakout must exceed range high by 0.2%
+    vol_mult: 2.2             # volume multiplier
+    ema_confirm: true         # require close > EMA
+    min_notional: 120000
+
+  breakdown_down:
+    range_lookback: 32
+    buffer_pct: 0.20
+    vol_mult: 2.2
+    ema_confirm: true
+    min_notional: 120000
+
+  ema_cross:                  # EMA cross rule base thresholds
+    vol_mult: 2.0
+    min_notional: 100000
+
+# Timeframe-specific adjustments
+timeframes:
+  "15m":
+    pump_adjust: {delta_pct: 1.4, vol_mult: 2.6, min_notional: 80000}
+    dump_adjust: {delta_pct: -1.4, vol_mult: 2.6, min_notional: 80000}
+    bo_up_adjust: {vol_mult: 2.2, min_notional: 120000}
+    bo_dn_adjust: {vol_mult: 2.2, min_notional: 120000}
+    cross_adjust: {vol_mult: 2.0, min_notional: 100000}
+
+  "30m":
+    pump_adjust: {delta_pct: 2.2, vol_mult: 2.2, min_notional: 120000}
+    dump_adjust: {delta_pct: -2.2, vol_mult: 2.2, min_notional: 120000}
+    bo_up_adjust: {vol_mult: 2.0, min_notional: 150000}
+    bo_dn_adjust: {vol_mult: 2.0, min_notional: 150000}
+    cross_adjust: {vol_mult: 1.8, min_notional: 150000}
+
+  "1h":
+    pump_adjust: {delta_pct: 3.2, vol_mult: 2.0, min_notional: 150000}
+    dump_adjust: {delta_pct: -3.2, vol_mult: 2.0, min_notional: 150000}
+    bo_up_adjust: {vol_mult: 1.8, min_notional: 200000}
+    bo_dn_adjust: {vol_mult: 1.8, min_notional: 200000}
+    cross_adjust: {vol_mult: 1.6, min_notional: 180000}
+
+# Telegram alert settings
+telegram:
+  enable: true                # true = send alerts
+  prefix: "TS"                # prefix added at start of alert
+  throttle_sec: 2             # min spacing between alerts (ms)
+
+# Logging settings
+logging:
+  level: "INFO"               # INFO, DEBUG, WARN
+  to_file: false              # true = also write to file
+  file_path: "/root/trade-seeker/logs/bot.log"
+
+symbols:
+  mode: "AUTO_USDT"
+  blacklist:
+    - USDCUSDT
+    - FDUSDUSDT
+    - TUSDUSDT
+    - DAIUSDT
+    - USDPUSDT

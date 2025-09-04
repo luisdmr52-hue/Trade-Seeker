@@ -80,7 +80,7 @@ timeframes:
 telegram:
   enable: true                # true = send alerts
   prefix: "TS"                # prefix added at start of alert
-  throttle_sec: 2             # min spacing between alerts (ms)
+  throttle_sec: 2             # min spacing between alerts (seconds)
 
 # Logging settings
 logging:
@@ -88,11 +88,3 @@ logging:
   to_file: false              # true = also write to file
   file_path: "/root/trade-seeker/logs/bot.log"
 
-symbols:
-  mode: "AUTO_USDT"
-  blacklist:
-    - USDCUSDT
-    - FDUSDUSDT
-    - TUSDUSDT
-    - DAIUSDT
-    - USDPUSDT

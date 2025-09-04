@@ -17,13 +17,18 @@ Design:
 """
 
 import os, sys, time, json
-from datetime import datetime
 from typing import Dict, List, Any
 import requests
 import statistics as stats
 import yaml
 
-import os, requests
+from datetime import datetime, timezone
+
+from logx import boot, cfg, rule, http, err, http_get, guarded
+
+BOT_VER: str = "v3.4"
+symbols: List[str] = []
+
 
 def tg_ping(msg: str):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -42,6 +47,17 @@ def tg_ping(msg: str):
 # ----------------------------- Telegram -------------------------------------
 
 def tg_send(msg: str):
+    # structured log for every alert
+
+    try:
+
+        rule("alert", text=msg)
+
+    except Exception:
+
+        pass
+
+
     tg = CONFIG.get("telegram", {})
     if not tg.get("enable", True):
         return
@@ -100,9 +116,9 @@ def fetch_usdt_symbols() -> List[str]:
     path = cfg("symbols.tier_file")
     if path and os.path.exists(path):
         with open(path) as f:
-            syms = [line.strip() for line in f if line.strip() and line.strip().endswith("USDT")]
-        if syms:
-            return syms
+            symbols = [line.strip() for line in f if line.strip() and line.strip().endswith("USDT")]
+        if symbols:
+            return symbols
 
     # Fallback: public exchangeInfo
     try:
@@ -306,37 +322,68 @@ def poll_once(symbols: List[str]):
                         mark_cooldown(sym,"cross_dn")
 
                 # small spacing between alerts
-                time.sleep(max(0.0, float(cfg("telegram.throttle_sec", 2))) / 1000.0)
-
+                time.sleep(max(0.0, float(cfg("telegram.throttle_sec", 2))))
             except Exception as e:
                 print(f"[{sym} {tf}] error: {e}")
 
 # --------------------------------- Runner -----------------------------------
 
 def run():
+
     print("[BOOT] loading config…")
+
     load_config(force=True)
+
     syms = fetch_usdt_symbols()
+
+    if not syms:
+
+        print("[ERR] no symbols resolved; check config.symbols.* or tier_file")
+
+        sys.exit(2)
+
     tfs = list((cfg("timeframes", {}) or {}).keys())
+
     print(f"[BOOT] Symbols: {len(syms)} | TFs: {tfs}")
 
+
+
     # Startup pings
+
     try:
+
         print("[BOOT] sending startup ping…", flush=True)
+
         tg_ping(f"Trade Seeker started | {len(syms)} syms | TFs: {tfs}")
+
         tg_send("TS booted (backup send)")
+
     except Exception as e:
+
         print(f"[BOOT] ping error: {e}", flush=True)
 
-while True:
+
+
+    while True:
+
         try:
+
             poll_once(syms)
+
         except KeyboardInterrupt:
-            print("bye")
-            break
+
+            print("bye"); break
+
         except Exception as e:
+
             print(f"[LOOP] {e}")
+
         time.sleep(5)  # idle; hot-reload handled by mtime check
 
+
+
 if __name__ == "__main__":
+
     run()
+
+
