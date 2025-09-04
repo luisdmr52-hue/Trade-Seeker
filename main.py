@@ -341,6 +341,10 @@ def run():
         print("[ERR] no symbols resolved; check config.symbols.* or tier_file")
 
         sys.exit(2)
+    global symbols
+
+    symbols = list(syms)
+
 
     tfs = list((cfg("timeframes", {}) or {}).keys())
 
