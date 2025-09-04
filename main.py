@@ -29,6 +29,31 @@ from logx import boot, cfg, rule, guarded
 
 BOT_VER: str = "v3.4"
 symbols: List[str] = []
+BOOT_SENT = "/tmp/tradeseeker.booted"
+
+
+
+def boot_ping_once(syms, tfs):
+
+    try:
+
+        if os.path.exists(BOOT_SENT):
+
+            log("BOOT", "ping skipped (already sent this boot)")
+
+            return
+
+        log("BOOT", "sending startup ping…")
+
+        tg_ping(f"Trade Seeker started | {len(syms)} syms | TFs: {tfs}")
+
+        open(BOOT_SENT, "w").write(str(time.time()))
+
+    except Exception as e:
+
+        log("ERR", f"ping error: {e}")
+
+
 
 # --- logging helper (tags uniformes) ---
 
@@ -426,45 +451,52 @@ def poll_once(symbols: List[str]):
 
 # --------------------------------- Runner -----------------------------------
 
+
 def run():
 
-    print("[BOOT] loading config…")
+    # BOOT
+
+    log("BOOT", "loading config…")
 
     load_config(force=True)
+
+
+
+    # symbols
 
     syms = fetch_usdt_symbols()
 
     if not syms:
 
-        print("[ERR] no symbols resolved; check config.symbols.* or tier_file")
+        log("ERR", "no symbols resolved; check config.symbols.* or tier_file")
 
         sys.exit(2)
+
+
+
+    # publica alias global para helpers antiguos
+
     global symbols
 
     symbols = list(syms)
 
 
+
+    # timeframes y estado
+
     tfs = list((cfg("timeframes", {}) or {}).keys())
 
-    print(f"[BOOT] Symbols: {len(syms)} | TFs: {tfs}")
+    log("CFG", f"Symbols: {len(syms)} | TFs: {tfs}")
 
 
 
-    # Startup pings
+    # ping de arranque (una sola vez por boot)
 
-    try:
-
-        print("[BOOT] sending startup ping…", flush=True)
-
-        tg_ping(f"Trade Seeker started | {len(syms)} syms | TFs: {tfs}")
-
-        tg_send("TS booted (backup send)")
-
-    except Exception as e:
-
-        print(f"[BOOT] ping error: {e}", flush=True)
+    boot_ping_once(syms, tfs)
 
 
+
+    # loop principal
 
     while True:
 
@@ -474,18 +506,20 @@ def run():
 
         except KeyboardInterrupt:
 
-            print("bye"); break
+            log("BOOT", "shutdown requested (KeyboardInterrupt)")
+
+            break
 
         except Exception as e:
 
-            print(f"[LOOP] {e}")
+            # error controlado + backoff corto
 
-        time.sleep(5)  # idle; hot-reload handled by mtime check
+            log("ERR", f"loop: {type(e).__name__}: {e}")
 
+            time.sleep(5)  # idle; hot-reload handled by mtime check
 
 
 if __name__ == "__main__":
 
     run()
-
 
