@@ -29,25 +29,58 @@ from logx import boot, cfg, rule, guarded
 
 BOT_VER: str = "v3.4"
 symbols: List[str] = []
-BOOT_SENT = "/tmp/tradeseeker.booted"
+
+# Sentinel en /run (se borra en reboot del host y NO está afectado por PrivateTmp)
+
+BOOT_SENT = "/run/tradeseeker.booted"
+
+BOOT_PING_DONE = False
 
 
 
 def boot_ping_once(syms, tfs):
 
+    """Send boot ping only once por proceso/boot (flag + sentinel atómico)."""
+
     try:
 
-        if os.path.exists(BOOT_SENT):
+        global BOOT_PING_DONE
 
-            log("BOOT", "ping skipped (already sent this boot)")
+        if BOOT_PING_DONE:
+
+            log("BOOT", "ping skipped (already sent: flag)")
 
             return
+
+
+
+        # intento de creación atómica; si existe -> saltar
+
+        try:
+
+            with open(BOOT_SENT, "x") as f:
+
+                f.write(str(time.time()))
+
+                f.flush(); os.fsync(f.fileno())
+
+        except FileExistsError:
+
+            log("BOOT", "ping skipped (already sent: sentinel)")
+
+            BOOT_PING_DONE = True
+
+            return
+
+
 
         log("BOOT", "sending startup ping…")
 
         tg_ping(f"Trade Seeker started | {len(syms)} syms | TFs: {tfs}")
 
-        open(BOOT_SENT, "w").write(str(time.time()))
+        BOOT_PING_DONE = True
+
+
 
     except Exception as e:
 
