@@ -17,6 +17,7 @@ Design:
 """
 
 import os, sys, time, json
+import uuid, random
 from typing import Dict, List, Any
 import requests
 import statistics as stats
@@ -24,55 +25,152 @@ import yaml
 
 from datetime import datetime, timezone
 
-from logx import boot, cfg, rule, http, err, http_get, guarded
+from logx import boot, cfg, rule, guarded
 
 BOT_VER: str = "v3.4"
 symbols: List[str] = []
 
+# --- logging helper (tags uniformes) ---
+
+def log(tag: str, msg: str):
+
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    print(f"{ts} [{tag}] {msg}", flush=True)
+
+
+
+# --- Circuit Breaker muy compacto ---
+
+class Circuit:
+
+    def __init__(self, fail_threshold: int = 5, cooldown_s: int = 30):
+
+        self.fail_th = fail_threshold
+
+        self.cool = cooldown_s
+
+        self.open_until = 0.0
+
+        self.fails = 0
+
+    def allow(self) -> bool:
+
+        return time.time() >= self.open_until
+
+    def report(self, ok: bool):
+
+        if ok: self.fails = 0
+
+        else:
+
+            self.fails += 1
+
+            if self.fails >= self.fail_th:
+
+                self.open_until = time.time() + self.cool
+
+                self.fails = 0
+
+
+
+_http_circuit = Circuit()
+
+
+
+def _sleep_backoff(i: int, base: float = 0.35):
+
+    time.sleep(base * (2 ** i) * (0.85 + random.random() * 0.30))
+
+
+
+def http_call(method: str, url: str, *, json_body=None, timeout: int = 6, retries: int = 3):
+
+    if not _http_circuit.allow():
+
+        log("HTTP", f"SKIP circuit-open {url}")
+
+        return None
+
+    rid = uuid.uuid4().hex[:8]
+
+    for i in range(retries + 1):
+
+        t0 = time.time()
+
+        try:
+
+            r = requests.get(url, timeout=timeout) if method == "GET" else requests.post(url, json=json_body, timeout=timeout)
+
+            dt = time.time() - t0
+
+            if r.status_code < 400:
+
+                log("HTTP", f"req={rid} {method} {r.status_code} {dt:.3f}s {url}")
+
+                _http_circuit.report(True)
+
+                return r.text
+
+            else:
+
+                log("HTTP", f"req={rid} {method} {r.status_code} {dt:.3f}s retry={i} {url}")
+
+        except Exception as e:
+
+            log("HTTP", f"req={rid} {method} EXC {type(e).__name__}: {e} retry={i} {url}")
+
+        _http_circuit.report(False)
+
+        if i < retries: _sleep_backoff(i)
+
+    log("ERR", f"http_call GIVEUP {method} {url}")
+
+    return None
+
+
+
+def http_get(url: str, **kw):  return http_call("GET", url, **kw)
+
+def http_post(url: str, json=None, **kw):  return http_call("POST", url, json_body=json, **kw)
+
+
 
 def tg_ping(msg: str):
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
+
     chat  = os.getenv("TELEGRAM_CHAT_ID")
+
     if not token or not chat:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": msg},
-            timeout=8
-        )
-    except Exception:
-        pass
+
+        log("ERR", "TELEGRAM env missing")
+
+        return False
+
+    url  = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    body = {"chat_id": chat, "text": msg}
+
+    log("RULE", f'alert | {{"text":"{msg[:60]}..."}}')
+
+    return http_post(url, json=body) is not None
+
+
+
+def tg_send(msg: str):
+
+    # si quieres además tu evento estructurado, descomenta la línea siguiente
+
+    # rule("alert", text=msg)
+
+    return tg_ping(msg)
+
+
 
 # ----------------------------- Telegram -------------------------------------
 
-def tg_send(msg: str):
-    # structured log for every alert
 
-    try:
-
-        rule("alert", text=msg)
-
-    except Exception:
-
-        pass
-
-
-    tg = CONFIG.get("telegram", {})
-    if not tg.get("enable", True):
-        return
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat  = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": msg, "disable_web_page_preview": True, "parse_mode": "Markdown"},
-            timeout=6
-        )
-    except Exception:
-        pass
 
 # --------------------------- Config / Hot reload ----------------------------
 
