@@ -1,0 +1,13 @@
+
+{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object",
+
+ "required":["symbol","side","confidence","rr_est","reasons","version","ts","ttl_min"],
+
+ "properties":{"symbol":{"type":"string"},"side":{"type":"string","enum":["long","short"]},
+
+ "confidence":{"type":"number","minimum":0,"maximum":1},"rr_est":{"type":"number","minimum":0},
+
+ "reasons":{"type":"array","items":{"type":"string"}},"version":{"type":"string"},
+
+ "ts":{"type":"string","format":"date-time"},"ttl_min":{"type":"integer","minimum":1}}}
+
