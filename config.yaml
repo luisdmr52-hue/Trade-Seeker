@@ -58,6 +58,11 @@ rules:
     vol_mult:       2.0
     min_notional:   100000
 
+  # Fast 15m loop — dedicated breakout detection every ~15s
+  fast_loop:
+    min_notional: 40000   # lower bar than main loop
+    cooldown_min: 10      # separate cooldown from main loop
+
   # EARLY layer — fires intrabar before CONFIRMED thresholds
   early:
     delta_pct:      2.5    # % move from open (pump early trigger)
@@ -70,6 +75,8 @@ rules:
 
 timeframes:
   "15m":
+    early_enabled: true          # EARLY fires on 15m
+    late_filter_pct: ~           # no late filter on 15m (velas cortas)
     pump_adjust:  {delta_pct: 1.4, vol_mult: 2.6, min_notional: 80000}
     dump_adjust:  {delta_pct: -1.4, vol_mult: 2.6, min_notional: 80000}
     bo_up_adjust: {vol_mult: 2.2, min_notional: 120000}
@@ -77,6 +84,8 @@ timeframes:
     cross_adjust: {vol_mult: 2.0, min_notional: 100000}
 
   "30m":
+    early_enabled: true          # EARLY fires on 30m
+    late_filter_pct: ~           # no late filter on 30m
     pump_adjust:  {delta_pct: 2.2, vol_mult: 2.2, min_notional: 120000}
     dump_adjust:  {delta_pct: -2.2, vol_mult: 2.2, min_notional: 120000}
     bo_up_adjust: {vol_mult: 2.0, min_notional: 150000}
@@ -84,6 +93,8 @@ timeframes:
     cross_adjust: {vol_mult: 1.8, min_notional: 150000}
 
   "1h":
+    early_enabled: false         # EARLY disabled on 1h — not meaningful
+    late_filter_pct: 5.0         # silenciar si la vela ya subio/bajo >5%
     pump_adjust:  {delta_pct: 3.2, vol_mult: 2.0, min_notional: 150000}
     dump_adjust:  {delta_pct: -3.2, vol_mult: 2.0, min_notional: 150000}
     bo_up_adjust: {vol_mult: 1.8, min_notional: 200000}

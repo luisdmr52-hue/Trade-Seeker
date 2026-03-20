@@ -329,6 +329,13 @@ def scan_symbol(sym: str, tf: str, adj: dict, rules_on: dict,
         v_med = median([b[4] for b in ohlcv[-20:]], 0.0)
         bar_not = notional(o, h, l, c, v)
 
+        # Late filter — skip all alerts if current bar move already exceeds threshold
+        late_pct = adj.get("late_filter_pct", None)
+        if late_pct is not None:
+            bar_move = abs((c - o) / o * 100.0) if o else 0.0
+            if bar_move >= late_pct:
+                return []
+
         pump_adj  = {**(cfg("rules.pump_spike", {}) or {}),    **(adj.get("pump_adjust", {}) or {})}
         dump_adj  = {**(cfg("rules.dump_spike", {}) or {}),    **(adj.get("dump_adjust", {}) or {})}
         bo_up_adj = {**(cfg("rules.breakout_up", {}) or {}),   **(adj.get("bo_up_adjust", {}) or {})}
@@ -372,13 +379,15 @@ def scan_symbol(sym: str, tf: str, adj: dict, rules_on: dict,
                 alerts.append((format_alert(sym, tf, "EMA_CROSS_DN", extras, c), "cross_dn"))
 
         # 6) Pump EARLY — separate cooldown key "pump_early"
-        if rules_on.get("pump_early", True) and not on_cooldown(sym, "pump_early", early_cfg.get("cooldown_min", 10)):
+        # early_enabled: can be disabled per timeframe in config (e.g. 1h)
+        early_enabled = adj.get("early_enabled", True)
+        if early_enabled and rules_on.get("pump_early", True) and not on_cooldown(sym, "pump_early", early_cfg.get("cooldown_min", 10)):
             ok, extras = rule_pump_early(last, early_cfg, v_med)
             if ok and bar_not >= early_cfg.get("min_notional", 50000):
                 alerts.append((format_alert(sym, tf, "PUMP_EARLY", extras, c), "pump_early"))
 
         # 7) Breakout Up EARLY — separate cooldown key "bo_up_early"
-        if rules_on.get("breakout_up_early", True) and not on_cooldown(sym, "bo_up_early", early_cfg.get("cooldown_min", 10)):
+        if early_enabled and rules_on.get("breakout_up_early", True) and not on_cooldown(sym, "bo_up_early", early_cfg.get("cooldown_min", 10)):
             ok, extras = rule_breakout_up_early(ohlcv, early_cfg, ema_len)
             if ok and bar_not >= early_cfg.get("min_notional", 50000):
                 alerts.append((format_alert(sym, tf, "BREAKOUT_UP_EARLY", extras, c), "bo_up_early"))
@@ -454,6 +463,109 @@ def poll_once(symbols: List[str]):
         time.sleep(throttle)
 
 
+# --- Fast 15m breakout loop (dedicated, runs every ~15s) ---
+
+def scan_symbol_fast(sym: str) -> list:
+    """
+    Lightweight scan for 15m breakout only.
+    Fetches only 5 candles (3 closed + 1 current + 1 buffer).
+    Returns list of (alert_str, cooldown_key) or empty.
+    """
+    try:
+        k = get_klines(sym, "15m", limit=5)
+        if len(k) < 4:
+            return []
+
+        ohlcv = [
+            (float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5]))
+            for x in k
+        ]
+
+        # Last 3 closed candles + current (in progress)
+        closed = ohlcv[-4:-1]   # 3 closed
+        current = ohlcv[-1]     # current candle (in progress)
+
+        o, h, l, c, v = current
+        rng_hi = max(b[1] for b in closed)           # highest high of last 3 closed
+        trigger = rng_hi * 1.005                      # 0.5% buffer
+
+        # Volume: current vs median of 3 closed
+        v_med = median([b[4] for b in closed], 0.0)
+        vol_ok = v >= (1.5 * (v_med or 1))
+
+        # Notional filter (lighter than main loop)
+        bar_not = v * ((h + l + c) / 3.0)
+        notional_ok = bar_not >= cfg("rules.fast_loop.min_notional", 40000)
+
+        if c > trigger and vol_ok and notional_ok:
+            extras = {
+                "rng_hi": round(rng_hi, 6),
+                "delta_pct": round((c - rng_hi) / rng_hi * 100, 3),
+                "vol_ratio": round(v / (v_med or 1), 2),
+                "early": True
+            }
+            pre = cfg("telegram.prefix", "TS")
+            alert_str = f"[{pre}] BREAKOUT_15M_EARLY | {sym} 15m @ {c:.6g} | {json.dumps(extras, separators=(',',':'))}"
+            return [(alert_str, "breakout_15m_early")]
+
+    except Exception as e:
+        pass  # silent — fast loop prioritizes speed
+
+    return []
+
+
+def run_fast_loop(symbols: List[str]):
+    """
+    Dedicated fast loop for 15m breakout detection.
+    Runs every ~15s using parallel fetches.
+    Separate cooldown key from main loop.
+    """
+    cooldown_min = cfg("rules.fast_loop.cooldown_min", 10)
+    workers = cfg("scanner.parallel_workers", 25)
+    throttle = max(0.0, float(cfg("telegram.throttle_sec", 2)))
+
+    log("FAST", f"loop started | {len(symbols)} symbols | cooldown={cooldown_min}m")
+
+    while True:
+        try:
+            load_config()
+            t0 = time.time()
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(scan_symbol_fast, sym): sym
+                    for sym in symbols
+                    if not on_cooldown(sym, "breakout_15m_early", cooldown_min)
+                }
+                alerts = []
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result:
+                            sym = futures[future]
+                            alerts.extend([(sym, a, k) for a, k in result])
+                    except Exception:
+                        pass
+
+            scan_time = time.time() - t0
+            if alerts:
+                log("FAST", f"scan={scan_time:.1f}s | alerts={len(alerts)}")
+
+            for sym, alert_str, cd_key in alerts:
+                tg_send(alert_str)
+                mark_cooldown(sym, cd_key)
+                time.sleep(throttle)
+
+            # Sleep remainder of 15s cycle
+            elapsed = time.time() - t0
+            sleep_time = max(1.0, 15.0 - elapsed)
+            time.sleep(sleep_time)
+
+        except Exception as e:
+            log("ERR", f"fast_loop: {type(e).__name__}: {e}")
+            time.sleep(5)
+
+
 # --- Runner ---
 def run():
     log("BOOT", "loading config…")
@@ -471,6 +583,12 @@ def run():
     log("CFG", f"Symbols: {len(syms)} | TFs: {tfs} | BOT_VER: {BOT_VER}")
 
     boot_ping_once(syms, tfs)
+
+    # Launch fast 15m loop in background thread
+    import threading
+    fast_thread = threading.Thread(target=run_fast_loop, args=(symbols,), daemon=True)
+    fast_thread.start()
+    log("BOOT", "fast loop thread started")
 
     while True:
         try:
