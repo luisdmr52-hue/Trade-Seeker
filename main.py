@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """
 Trade Seeker — Multi-Rule Spot Scanner (Binance USDT)
-v4.0 — Parallel fetch + EARLY detection layer
+v4.1 — Fast loop migrated to Timescale (ts_feed.py)
 
-Detectors (total = 7):
-1) Pump spike (CONFIRMED)
-2) Dump spike (CONFIRMED)
-3) Breakout Up (CONFIRMED)
-4) Breakdown Down (CONFIRMED)
-5) EMA Momentum Cross (UP/DOWN)
-6) Pump Early  ← NEW
-7) Breakout Up Early  ← NEW
-
-Changes from v3.4:
-- poll_once now uses ThreadPoolExecutor for parallel kline fetching
-  (scan time: ~minutes → ~15-20s for 400 symbols)
-- EARLY detection layer: fires intrabar before CONFIRMED thresholds
-- EARLY and CONFIRMED use separate cooldown keys (both can fire same candle)
+Changes from v4.0:
+- run_fast_loop now queries metrics_ext via TSFeed instead of REST klines
+- Detects PUMP_FAST (delta price between snapshots + buy_vol_ratio filter)
+- Latency: ~1-3s vs ~15s (REST fast loop)
+- poll_once (CONFIRMED/EMA rules) unchanged — still uses REST klines
+- TSFeed reconnects automatically on connection drop
 """
 
 import os, sys, time, json
 import uuid, random
+import threading
 from typing import Dict, List, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -30,7 +23,10 @@ import yaml
 from datetime import datetime, timezone
 from logx import boot, cfg, rule, guarded
 
-BOT_VER: str = "v4.0"
+# TSFeed import — ts_feed.py must be in same directory
+from ts_feed import TSFeed, PriceTracker, buy_vol_ratio
+
+BOT_VER: str = "v4.1"
 symbols: List[str] = []
 
 BOOT_SENT = "/run/tradeseeker.booted"
@@ -258,10 +254,6 @@ def rule_ema_cross(ohlcv, fast_len, slow_len, direction, tf_adj):
 
 # --- Rules (EARLY) ---
 def rule_pump_early(bar, early_cfg, v_med):
-    """
-    Fires intrabar when price is already up delta_pct from open,
-    before the candle closes. Uses looser vol threshold than CONFIRMED.
-    """
     o, h, l, c, v = bar
     pct = (c - o) / o * 100.0 if o else 0.0
     vol_ok = v >= (early_cfg["vol_mult"] * (v_med or 1))
@@ -269,10 +261,6 @@ def rule_pump_early(bar, early_cfg, v_med):
     return triggered, {"delta_pct": round(pct, 3), "early": True}
 
 def rule_breakout_up_early(ohlcv, early_cfg, ema_len):
-    """
-    Fires when price breaks range high intrabar, with looser vol.
-    EMA confirm optional (default True) — same as CONFIRMED but lower vol threshold.
-    """
     closes = [b[3] for b in ohlcv]
     highs = [b[1] for b in ohlcv]
     vols = [b[4] for b in ohlcv]
@@ -289,15 +277,18 @@ def rule_breakout_up_early(ohlcv, early_cfg, ema_len):
 
 # --- Cooldowns ---
 COOLDOWNS: Dict[str, float] = {}
+_cooldown_lock = threading.Lock()
 
 def on_cooldown(symbol: str, rule: str, cooldown_min: int) -> bool:
     now = time.time()
     key = f"{symbol}:{rule}"
-    last = COOLDOWNS.get(key, 0)
+    with _cooldown_lock:
+        last = COOLDOWNS.get(key, 0)
     return (now - last) < (cooldown_min * 60)
 
 def mark_cooldown(symbol: str, rule: str):
-    COOLDOWNS[f"{symbol}:{rule}"] = time.time()
+    with _cooldown_lock:
+        COOLDOWNS[f"{symbol}:{rule}"] = time.time()
 
 # --- Alert formatter ---
 def format_alert(sym, tf, rule_name, extras, price):
@@ -308,13 +299,7 @@ def format_alert(sym, tf, rule_name, extras, price):
 def scan_symbol(sym: str, tf: str, adj: dict, rules_on: dict,
                 ema_len: int, ema_fast: int, ema_slow: int,
                 lookback: int, cooldown: int, early_cfg: dict) -> List[str]:
-    """
-    Fetches klines for one symbol/tf and evaluates all rules.
-    Returns list of alert strings to send (empty = no alerts).
-    Thread-safe: only reads COOLDOWNS, writes via returned alerts list
-    (cooldown marking happens in main thread after alerts are sent).
-    """
-    alerts = []  # (alert_str, cooldown_key)
+    alerts = []
     try:
         k = get_klines(sym, tf, limit=max(lookback + 50, 120))
         ohlcv = [
@@ -329,64 +314,54 @@ def scan_symbol(sym: str, tf: str, adj: dict, rules_on: dict,
         v_med = median([b[4] for b in ohlcv[-20:]], 0.0)
         bar_not = notional(o, h, l, c, v)
 
-        # Late filter — skip all alerts if current bar move already exceeds threshold
         late_pct = adj.get("late_filter_pct", None)
         if late_pct is not None:
             bar_move = abs((c - o) / o * 100.0) if o else 0.0
             if bar_move >= late_pct:
                 return []
 
-        pump_adj  = {**(cfg("rules.pump_spike", {}) or {}),    **(adj.get("pump_adjust", {}) or {})}
-        dump_adj  = {**(cfg("rules.dump_spike", {}) or {}),    **(adj.get("dump_adjust", {}) or {})}
-        bo_up_adj = {**(cfg("rules.breakout_up", {}) or {}),   **(adj.get("bo_up_adjust", {}) or {})}
-        bo_dn_adj = {**(cfg("rules.breakdown_down", {}) or {}),**(adj.get("bo_dn_adjust", {}) or {})}
-        cross_adj = {**(cfg("rules.ema_cross", {}) or {}),     **(adj.get("cross_adjust", {}) or {})}
+        pump_adj  = {**(cfg("rules.pump_spike", {}) or {}),     **(adj.get("pump_adjust", {}) or {})}
+        dump_adj  = {**(cfg("rules.dump_spike", {}) or {}),     **(adj.get("dump_adjust", {}) or {})}
+        bo_up_adj = {**(cfg("rules.breakout_up", {}) or {}),    **(adj.get("bo_up_adjust", {}) or {})}
+        bo_dn_adj = {**(cfg("rules.breakdown_down", {}) or {}), **(adj.get("bo_dn_adjust", {}) or {})}
+        cross_adj = {**(cfg("rules.ema_cross", {}) or {}),      **(adj.get("cross_adjust", {}) or {})}
 
-        # 1) Pump CONFIRMED
         if rules_on.get("pump_spike", True) and not on_cooldown(sym, "pump", cooldown):
             ok, extras = rule_pump(last, pump_adj, v_med)
             if ok and bar_not >= pump_adj["min_notional"]:
                 alerts.append((format_alert(sym, tf, "PUMP", extras, c), "pump"))
 
-        # 2) Dump CONFIRMED
         if rules_on.get("dump_spike", True) and not on_cooldown(sym, "dump", cooldown):
             ok, extras = rule_dump(last, dump_adj, v_med)
             if ok and bar_not >= dump_adj["min_notional"]:
                 alerts.append((format_alert(sym, tf, "DUMP", extras, c), "dump"))
 
-        # 3) Breakout Up CONFIRMED
         if rules_on.get("breakout_up", True) and not on_cooldown(sym, "bo_up", cooldown):
             ok, extras = rule_breakout_up(ohlcv, bo_up_adj, ema_len)
             if ok and bar_not >= bo_up_adj["min_notional"]:
                 alerts.append((format_alert(sym, tf, "BREAKOUT_UP", extras, c), "bo_up"))
 
-        # 4) Breakdown Down CONFIRMED
         if rules_on.get("breakdown_down", True) and not on_cooldown(sym, "bo_dn", cooldown):
             ok, extras = rule_breakdown_dn(ohlcv, bo_dn_adj, ema_len)
             if ok and bar_not >= bo_dn_adj["min_notional"]:
                 alerts.append((format_alert(sym, tf, "BREAKDOWN_DN", extras, c), "bo_dn"))
 
-        # 5a) EMA Cross UP
         if rules_on.get("ema_cross_up", True) and not on_cooldown(sym, "cross_up", cooldown):
             ok, extras = rule_ema_cross(ohlcv, ema_fast, ema_slow, "up", cross_adj)
             if ok and bar_not >= cross_adj.get("min_notional", 0):
                 alerts.append((format_alert(sym, tf, "EMA_CROSS_UP", extras, c), "cross_up"))
 
-        # 5b) EMA Cross DOWN
         if rules_on.get("ema_cross_down", True) and not on_cooldown(sym, "cross_dn", cooldown):
             ok, extras = rule_ema_cross(ohlcv, ema_fast, ema_slow, "down", cross_adj)
             if ok and bar_not >= cross_adj.get("min_notional", 0):
                 alerts.append((format_alert(sym, tf, "EMA_CROSS_DN", extras, c), "cross_dn"))
 
-        # 6) Pump EARLY — separate cooldown key "pump_early"
-        # early_enabled: can be disabled per timeframe in config (e.g. 1h)
         early_enabled = adj.get("early_enabled", True)
         if early_enabled and rules_on.get("pump_early", True) and not on_cooldown(sym, "pump_early", early_cfg.get("cooldown_min", 10)):
             ok, extras = rule_pump_early(last, early_cfg, v_med)
             if ok and bar_not >= early_cfg.get("min_notional", 50000):
                 alerts.append((format_alert(sym, tf, "PUMP_EARLY", extras, c), "pump_early"))
 
-        # 7) Breakout Up EARLY — separate cooldown key "bo_up_early"
         if early_enabled and rules_on.get("breakout_up_early", True) and not on_cooldown(sym, "bo_up_early", early_cfg.get("cooldown_min", 10)):
             ok, extras = rule_breakout_up_early(ohlcv, early_cfg, ema_len)
             if ok and bar_not >= early_cfg.get("min_notional", 50000):
@@ -398,9 +373,9 @@ def scan_symbol(sym: str, tf: str, adj: dict, rules_on: dict,
     return alerts
 
 
-# --- Main polling (parallel) ---
+# --- Main polling (parallel REST — unchanged) ---
 def poll_once(symbols: List[str]):
-    load_config()  # hot-reload if file changed
+    load_config()
 
     rules_on  = cfg("rules.enable", {})
     ema_len   = cfg("rules.ema_len", 20)
@@ -411,30 +386,27 @@ def poll_once(symbols: List[str]):
     throttle  = max(0.0, float(cfg("telegram.throttle_sec", 2)))
     workers   = cfg("scanner.parallel_workers", 25)
 
-    # EARLY config — can be overridden in config.yaml under rules.early
     early_defaults = {
-        "delta_pct":    2.5,   # % move from open to trigger EARLY
-        "vol_mult":     1.8,   # looser than CONFIRMED (2.6x)
-        "min_notional": 50000, # lower bar to catch smaller caps early
-        "cooldown_min": 10,    # shorter cooldown than CONFIRMED (20 min)
+        "delta_pct":    2.5,
+        "vol_mult":     1.8,
+        "min_notional": 50000,
+        "cooldown_min": 10,
         "range_lookback": 32,
         "buffer_pct":   0.20,
         "ema_confirm":  True,
     }
     early_cfg = {**early_defaults, **(cfg("rules.early", {}) or {})}
-
     timeframes = cfg("timeframes", {}) or {}
 
-    # Build task list: (sym, tf, adj)
     tasks = [
         (sym, tf, adj)
         for tf, adj in timeframes.items()
         for sym in symbols
     ]
 
-    pending_alerts = []  # collect all alerts before sending
-
+    pending_alerts = []
     t0 = time.time()
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
@@ -456,110 +428,119 @@ def poll_once(symbols: List[str]):
     scan_time = time.time() - t0
     log("SCAN", f"completed {len(tasks)} tasks in {scan_time:.1f}s | alerts={len(pending_alerts)}")
 
-    # Send alerts sequentially (Telegram rate limit) and mark cooldowns
     for sym, alert_str, cd_key in pending_alerts:
         tg_send(alert_str)
         mark_cooldown(sym, cd_key)
         time.sleep(throttle)
 
 
-# --- Fast 15m breakout loop (dedicated, runs every ~15s) ---
+# ---------------------------------------------------------------------------
+# Fast loop v2 — Timescale-powered (replaces REST fast loop from v4.0)
+# ---------------------------------------------------------------------------
 
-def scan_symbol_fast(sym: str) -> list:
+def run_fast_loop(_symbols_unused: List[str]):
     """
-    Lightweight scan for 15m breakout only.
-    Fetches only 5 candles (3 closed + 1 current + 1 buffer).
-    Returns list of (alert_str, cooldown_key) or empty.
+    Fast detection loop using TSFeed (metrics_ext via Timescale).
+    Polls every POLL_INTERVAL seconds.
+    Detects PUMP_FAST: price delta between snapshots + buy_vol_ratio filter.
+
+    Config keys (config.yaml under rules.fast_ts):
+        poll_interval_s:  2      # seconds between snapshots
+        pump_pct:         0.30   # min % move between snapshots to trigger
+        min_vol_24h:      50000  # min USDT vol_24h to consider symbol
+        bv_ratio_min:     0.55   # min buy_vol/vol_24h ratio (day bias filter)
+        cooldown_min:     5      # cooldown in minutes after alert
     """
-    try:
-        k = get_klines(sym, "15m", limit=5)
-        if len(k) < 4:
-            return []
+    # Defaults — can be overridden in config.yaml under rules.fast_ts
+    DEFAULT_POLL   = 2
+    DEFAULT_PCT    = 0.30
+    DEFAULT_VOL    = 50_000
+    DEFAULT_BVR    = 0.55
+    DEFAULT_CD     = 5
 
-        ohlcv = [
-            (float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5]))
-            for x in k
-        ]
+    feed    = TSFeed()
+    tracker = PriceTracker()
 
-        # Last 3 closed candles + current (in progress)
-        closed = ohlcv[-4:-1]   # 3 closed
-        current = ohlcv[-1]     # current candle (in progress)
+    log("FAST", "Timescale fast loop started")
 
-        o, h, l, c, v = current
-        rng_hi = max(b[1] for b in closed)           # highest high of last 3 closed
-        trigger = rng_hi * 1.005                      # 0.5% buffer
-
-        # Volume: current vs median of 3 closed
-        v_med = median([b[4] for b in closed], 0.0)
-        vol_ok = v >= (1.5 * (v_med or 1))
-
-        # Notional filter (lighter than main loop)
-        bar_not = v * ((h + l + c) / 3.0)
-        notional_ok = bar_not >= cfg("rules.fast_loop.min_notional", 40000)
-
-        if c > trigger and vol_ok and notional_ok:
-            extras = {
-                "rng_hi": round(rng_hi, 6),
-                "delta_pct": round((c - rng_hi) / rng_hi * 100, 3),
-                "vol_ratio": round(v / (v_med or 1), 2),
-                "early": True
-            }
-            pre = cfg("telegram.prefix", "TS")
-            alert_str = f"[{pre}] BREAKOUT_15M_EARLY | {sym} 15m @ {c:.6g} | {json.dumps(extras, separators=(',',':'))}"
-            return [(alert_str, "breakout_15m_early")]
-
-    except Exception as e:
-        pass  # silent — fast loop prioritizes speed
-
-    return []
-
-
-def run_fast_loop(symbols: List[str]):
-    """
-    Dedicated fast loop for 15m breakout detection.
-    Runs every ~15s using parallel fetches.
-    Separate cooldown key from main loop.
-    """
-    cooldown_min = cfg("rules.fast_loop.cooldown_min", 10)
-    workers = cfg("scanner.parallel_workers", 25)
-    throttle = max(0.0, float(cfg("telegram.throttle_sec", 2)))
-
-    log("FAST", f"loop started | {len(symbols)} symbols | cooldown={cooldown_min}m")
+    consecutive_empty = 0
 
     while True:
         try:
             load_config()
+
+            poll_s   = cfg("rules.fast_ts.poll_interval_s", DEFAULT_POLL)
+            pump_pct = cfg("rules.fast_ts.pump_pct",        DEFAULT_PCT)
+            min_vol  = cfg("rules.fast_ts.min_vol_24h",     DEFAULT_VOL)
+            bvr_min  = cfg("rules.fast_ts.bv_ratio_min",    DEFAULT_BVR)
+            cd_min   = cfg("rules.fast_ts.cooldown_min",    DEFAULT_CD)
+            throttle = max(0.0, float(cfg("telegram.throttle_sec", 2)))
+            pre      = cfg("telegram.prefix", "TS")
+
             t0 = time.time()
+            snapshot = feed.get_snapshot()
 
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(scan_symbol_fast, sym): sym
-                    for sym in symbols
-                    if not on_cooldown(sym, "breakout_15m_early", cooldown_min)
+            if not snapshot:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    log("FAST", "WARNING: 3 consecutive empty snapshots — check Timescale/Benthos")
+                    consecutive_empty = 0
+                time.sleep(poll_s)
+                continue
+
+            consecutive_empty = 0
+            alerts = []
+
+            for sym, data in snapshot.items():
+                price   = data["price"]
+                vol     = data["vol_24h"] or 0
+                bv      = data["buy_vol"] or 0
+
+                # Liquidity filter
+                if vol < min_vol:
+                    tracker.update(sym, price)  # keep tracker state current
+                    continue
+
+                delta = tracker.update(sym, price)
+                if delta is None:
+                    continue  # first time seeing symbol — no baseline yet
+
+                # Only pump direction for now (add dump later if needed)
+                if delta < pump_pct:
+                    continue
+
+                # buy_vol_ratio as day-bias filter (not primary signal)
+                bvr = buy_vol_ratio(bv, vol)
+                if bvr < bvr_min:
+                    continue
+
+                if on_cooldown(sym, "pump_fast", cd_min):
+                    continue
+
+                extras = {
+                    "delta": round(delta, 3),
+                    "bvr":   round(bvr, 2),
+                    "fast":  True
                 }
-                alerts = []
-                for future in as_completed(futures):
-                    try:
-                        result = future.result()
-                        if result:
-                            sym = futures[future]
-                            alerts.extend([(sym, a, k) for a, k in result])
-                    except Exception:
-                        pass
+                alert_str = f"[{pre}] PUMP_FAST | {sym} WS @ {price:.6g} | {json.dumps(extras, separators=(',', ':'))}"
+                alerts.append((sym, alert_str))
 
-            scan_time = time.time() - t0
+            query_ms = (time.time() - t0) * 1000
+
             if alerts:
-                log("FAST", f"scan={scan_time:.1f}s | alerts={len(alerts)}")
+                log("FAST", f"query={query_ms:.1f}ms | symbols={len(snapshot)} | alerts={len(alerts)}")
+                for sym, alert_str in alerts:
+                    tg_send(alert_str)
+                    mark_cooldown(sym, "pump_fast")
+                    time.sleep(throttle)
+            # Uncomment below to see heartbeat every cycle (useful for debugging):
+            # else:
+            #     log("FAST", f"query={query_ms:.1f}ms | symbols={len(snapshot)} | hits=0")
 
-            for sym, alert_str, cd_key in alerts:
-                tg_send(alert_str)
-                mark_cooldown(sym, cd_key)
-                time.sleep(throttle)
-
-            # Sleep remainder of 15s cycle
+            # Sleep remainder of poll interval
             elapsed = time.time() - t0
-            sleep_time = max(1.0, 15.0 - elapsed)
-            time.sleep(sleep_time)
+            sleep_s = max(0.1, poll_s - elapsed)
+            time.sleep(sleep_s)
 
         except Exception as e:
             log("ERR", f"fast_loop: {type(e).__name__}: {e}")
@@ -584,11 +565,10 @@ def run():
 
     boot_ping_once(syms, tfs)
 
-    # Launch fast 15m loop in background thread
-    import threading
+    # Launch Timescale fast loop in background thread
     fast_thread = threading.Thread(target=run_fast_loop, args=(symbols,), daemon=True)
     fast_thread.start()
-    log("BOOT", "fast loop thread started")
+    log("BOOT", "Timescale fast loop thread started")
 
     while True:
         try:
