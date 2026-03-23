@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from logx import boot, cfg, rule, guarded
 
 # TSFeed import — ts_feed.py must be in same directory
-from ts_feed import TSFeed, PriceTracker, buy_vol_ratio
+from ts_feed import TSFeed, PriceTracker
 
 BOT_VER: str = "v4.1"
 symbols: List[str] = []
@@ -112,7 +112,7 @@ def tg_ping(msg: str):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat:
-        log("ERR", "TELEGRAM env missing")
+        log("ALERT", msg)
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     body = {"chat_id": chat, "text": msg}
@@ -455,7 +455,6 @@ def run_fast_loop(_symbols_unused: List[str]):
     DEFAULT_POLL   = 2
     DEFAULT_PCT    = 0.30
     DEFAULT_VOL    = 50_000
-    DEFAULT_BVR    = 0.55
     DEFAULT_CD     = 5
 
     feed    = TSFeed()
@@ -472,7 +471,6 @@ def run_fast_loop(_symbols_unused: List[str]):
             poll_s   = cfg("rules.fast_ts.poll_interval_s", DEFAULT_POLL)
             pump_pct = cfg("rules.fast_ts.pump_pct",        DEFAULT_PCT)
             min_vol  = cfg("rules.fast_ts.min_vol_24h",     DEFAULT_VOL)
-            bvr_min  = cfg("rules.fast_ts.bv_ratio_min",    DEFAULT_BVR)
             cd_min   = cfg("rules.fast_ts.cooldown_min",    DEFAULT_CD)
             throttle = max(0.0, float(cfg("telegram.throttle_sec", 2)))
             pre      = cfg("telegram.prefix", "TS")
@@ -494,7 +492,6 @@ def run_fast_loop(_symbols_unused: List[str]):
             for sym, data in snapshot.items():
                 price   = data["price"]
                 vol     = data["vol_24h"] or 0
-                bv      = data["buy_vol"] or 0
 
                 # Liquidity filter
                 if vol < min_vol:
@@ -509,9 +506,6 @@ def run_fast_loop(_symbols_unused: List[str]):
                 if delta < pump_pct:
                     continue
 
-                # buy_vol_ratio as day-bias filter (not primary signal)
-                bvr = buy_vol_ratio(bv, vol)
-                if bvr < bvr_min:
                     continue
 
                 if on_cooldown(sym, "pump_fast", cd_min):
@@ -519,7 +513,6 @@ def run_fast_loop(_symbols_unused: List[str]):
 
                 extras = {
                     "delta": round(delta, 3),
-                    "bvr":   round(bvr, 2),
                     "fast":  True
                 }
                 alert_str = f"[{pre}] PUMP_FAST | {sym} WS @ {price:.6g} | {json.dumps(extras, separators=(',', ':'))}"
