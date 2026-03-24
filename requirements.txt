@@ -5,7 +5,11 @@ aiohttp
 
 websockets
 
+websocket-client
+
 requests
 
 python-dateutil
+
+psycopg2-binary
 
