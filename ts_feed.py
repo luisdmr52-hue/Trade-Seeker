@@ -59,6 +59,7 @@ class TSFeed:
                 price,
                 buy_vol,
                 vol_24h,
+                quote_vol_24h,
                 ts
             FROM metrics_ext
             WHERE ts >= NOW() - INTERVAL '{window} seconds'
@@ -106,16 +107,16 @@ class PriceTracker:
         self.prev.pop(symbol, None)
 
 
-def buy_vol_ratio(buy_vol: float, vol_24h: float) -> float:
+def buy_vol_ratio(buy_vol: float, quote_vol_24h: float) -> float:
     """
     buy_vol / vol_24h — taker buy as fraction of total 24h volume.
     > 0.55 → mild buy bias
     > 0.65 → strong buy bias
     Returns 0.5 if vol_24h is zero (neutral, no bias info).
     """
-    if not vol_24h:
+    if not quote_vol_24h:
         return 0.5
-    return buy_vol / vol_24h
+    return buy_vol / quote_vol_24h
 
 
 # ---------------------------------------------------------------------------
