@@ -416,7 +416,7 @@ def run_fast_loop(_symbols_unused: List[str]):
     DEFAULT_CD     = 5
     DEFAULT_RATIO  = 0.60
     DEFAULT_WINDOW = 30
-    DEFAULT_TTL    = 600
+    DEFAULT_TTL    = 90
 
     feed      = TSFeed()
     tracker   = PriceTracker()
@@ -479,7 +479,7 @@ def run_fast_loop(_symbols_unused: List[str]):
                 if delta >= pump_pct:
                     confirmer.add_candidate(sym)
 
-                if confirmer.is_confirmed(sym):
+                if confirmer.is_confirmed(sym) and delta >= pump_pct:
                     if not on_cooldown(sym, "pump_fast", cd_min):
                         state = confirmer.debug_state(sym)
                         extras = {
