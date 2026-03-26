@@ -52,11 +52,16 @@ REFRESH_MCAP_S          =     3600  # 60 min
 REFRESH_UNIVERSE_S      =     1800  # 30 min
 
 # CoinGecko rate limit: 30 req/min free tier -> 1 req every 2s is safe
-CG_REQUEST_DELAY_S = 2.0
+CG_REQUEST_DELAY_S = 3.0
 CG_LIST_TIMEOUT_S  = 20    # /coins/list is ~15K entries, needs more time
 CG_MCAP_CACHE_PATH = "/tmp/kts_cg_mcap_cache.json"
 
 TIMEOUT = 10  # default HTTP timeout
+
+# CoinGecko API key (Demo tier -- free, permanent)
+CG_API_KEY = os.getenv("KTS_CG_API_KEY", "")
+
+# CoinGecko API key (Demo tier — free, permanent)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +71,8 @@ TIMEOUT = 10  # default HTTP timeout
 def _get(url: str, params: dict = None, timeout: int = TIMEOUT) -> Optional[dict]:
     """Simple GET with timeout. Returns parsed JSON or None on error."""
     try:
-        r = requests.get(url, params=params, timeout=timeout)
+        headers = {"x-cg-demo-api-key": CG_API_KEY} if CG_API_KEY and "coingecko" in url else {}
+        r = requests.get(url, params=params, timeout=timeout, headers=headers)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -302,16 +308,14 @@ def build_universe(
         print(f"[UniverseFilter] build_universe: {counters} -> EMPTY (no vol candidates)")
         return []
 
-    # Step 3: dormancy -- pct25 over ALL USDT pairs (full market reference)
-    all_usdt_vols = [t["quoteVolume"] for t in ticker.values() if t["quoteVolume"] > 0]
-    dormancy_threshold = _percentile(all_usdt_vols, DORMANCY_PERCENTILE)
-    dormant_passed = [(sym, vol) for sym, vol in vol_filtered if vol <= dormancy_threshold]
-    counters["after_dormant"] = len(dormant_passed)
+    # Step 3: dormancy removed -- vol_range already defines the profile
+
+    counters["after_dormant"] = len(vol_filtered)  # dormancy removed
 
     # Step 4: market cap filter
     if use_mcap and mcap:
         final = []
-        for sym, _ in dormant_passed:
+        for sym, _ in vol_filtered:
             sym_mcap = mcap.get(sym)
             if sym_mcap is None:
                 counters["no_mcap_data"] += 1
@@ -320,7 +324,7 @@ def build_universe(
                 final.append(sym)
         counters["after_mcap"] = len(final)
     else:
-        final = [sym for sym, _ in dormant_passed]
+        final = [sym for sym, _ in vol_filtered]
         counters["after_mcap"] = len(final)
         if use_mcap and not mcap:
             print("[UniverseFilter] WARNING: mcap filter skipped (CoinGecko unavailable)")
