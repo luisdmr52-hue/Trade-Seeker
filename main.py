@@ -25,6 +25,8 @@ from logx import boot, cfg, rule, guarded
 
 from ts_feed import TSFeed, PriceTracker
 from aggtrade_confirmer import AggTradeConfirmer
+from universe_filter import UniverseFilter
+import outcome_tracker
 
 BOT_VER: str = "v4.2"
 symbols: List[str] = []
@@ -391,7 +393,7 @@ def poll_once(symbols: List[str]):
         time.sleep(throttle)
 
 
-def run_fast_loop(_symbols_unused: List[str]):
+def run_fast_loop(_symbols_unused: List[str], uf: UniverseFilter):
     """
     Fast loop v3 — Timescale detection + aggTrade confirmation (P3-B).
 
@@ -462,9 +464,12 @@ def run_fast_loop(_symbols_unused: List[str]):
                 continue
 
             consecutive_empty = 0
+            universe = set(uf.get_universe())
             confirmed_alerts  = []
 
             for sym, data in snapshot.items():
+                if universe and sym not in universe:
+                    continue
                 price = data["price"]
                 vol   = data["vol_24h"] or 0
 
@@ -489,15 +494,16 @@ def run_fast_loop(_symbols_unused: List[str]):
                             "confirmed": True,
                         }
                         alert_str = f"[{pre}] PUMP_FAST | {sym} WS @ {price:.6g} | {json.dumps(extras, separators=(',', ':'))}"
-                        confirmed_alerts.append((sym, alert_str))
+                        confirmed_alerts.append((sym, alert_str, price, extras))
                     confirmer.remove(sym)
 
             query_ms = (time.time() - t0) * 1000
 
             if confirmed_alerts:
                 log("FAST", f"query={query_ms:.1f}ms | symbols={len(snapshot)} | confirmed={len(confirmed_alerts)} | candidates={confirmer.active_count()}")
-                for sym, alert_str in confirmed_alerts:
+                for sym, alert_str, alert_price, alert_extras in confirmed_alerts:
                     tg_send(alert_str)
+                    outcome_tracker.record(sym, "PUMP_FAST", alert_price, alert_extras)
                     mark_cooldown(sym, "pump_fast")
                     time.sleep(throttle)
 
@@ -530,14 +536,18 @@ def run():
     log("CFG", f"Symbols: {len(syms)} | TFs: {tfs} | BOT_VER: {BOT_VER}")
 
     boot_ping_once(syms, tfs)
+    outcome_tracker.start_filler()
 
-    fast_thread = threading.Thread(target=run_fast_loop, args=(symbols,), daemon=True)
+    uf = UniverseFilter()
+    uf.start()
+    log("BOOT", f"UniverseFilter ready -- {len(uf.get_universe())} symbols")
+    fast_thread = threading.Thread(target=run_fast_loop, args=(symbols, uf), daemon=True)
     fast_thread.start()
     log("BOOT", "Timescale fast loop thread started")
 
     while True:
         try:
-            poll_once(syms)
+            pass  # poll_once disabled — PUMP_FAST only
         except KeyboardInterrupt:
             log("BOOT", "shutdown requested (KeyboardInterrupt)")
             break
