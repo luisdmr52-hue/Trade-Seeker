@@ -45,11 +45,12 @@ class _Candidate:
     def is_expired(self) -> bool:
         return time.time() > self.expires_at
 
-    def add_event(self, ts: float, qty: float, is_buyer_maker: bool):
+    def add_event(self, ts: float, price: float, qty: float, is_buyer_maker: bool):
         # is_buyer_maker=True → seller is taker (sell pressure) → negative
         # is_buyer_maker=False → buyer is taker (buy pressure) → positive
+        quote      = price * qty
         signed_qty = qty if not is_buyer_maker else -qty
-        self.events.append((ts, signed_qty))
+        self.events.append((ts, signed_qty, quote))
         self._trim()
 
     def _trim(self):
@@ -61,12 +62,18 @@ class _Candidate:
         self._trim()
         if not self.events:
             return None
-        buy   = sum(q for _, q in self.events if q > 0)
-        sell  = sum(abs(q) for _, q in self.events if q < 0)
+        buy   = sum(qty for _, qty, _ in self.events if qty > 0)
+        sell  = sum(abs(qty) for _, qty, _ in self.events if qty < 0)
         total = buy + sell
         if total == 0:
             return None
         return buy / total
+
+    def quote_vol_30s(self) -> float:
+        """Total USDT volume (buy + sell) in the current window."""
+        self._trim()
+        return sum(q for _, _, q in self.events)
+
 
     def n_events(self) -> int:
         self._trim()
@@ -180,10 +187,11 @@ class AggTradeConfirmer:
         def on_message(ws, message):
             try:
                 data           = json.loads(message)
+                price          = float(data["p"])
                 qty            = float(data["q"])
                 is_buyer_maker = bool(data["m"])
                 ts             = data["T"] / 1000.0
-                c.add_event(ts, qty, is_buyer_maker)
+                c.add_event(ts, price, qty, is_buyer_maker)
             except Exception as e:
                 c.error = str(e)
 

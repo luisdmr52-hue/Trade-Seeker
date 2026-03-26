@@ -26,6 +26,7 @@ from logx import boot, cfg, rule, guarded
 from ts_feed import TSFeed, PriceTracker
 from aggtrade_confirmer import AggTradeConfirmer
 from universe_filter import UniverseFilter
+from volume_filter import RelativeVolumeFilter
 import outcome_tracker
 
 BOT_VER: str = "v4.2"
@@ -429,6 +430,7 @@ def run_fast_loop(_symbols_unused: List[str], uf: UniverseFilter):
         log_fn=log,
     )
 
+    rvf = RelativeVolumeFilter(min_rel_volume=cfg("rules.fast_ts.rel_volume_min", 3.0))
     log("FAST", "Timescale fast loop v3 started (P3-B aggTrade confirmation)")
 
     consecutive_empty = 0
@@ -487,10 +489,22 @@ def run_fast_loop(_symbols_unused: List[str], uf: UniverseFilter):
                 if confirmer.is_confirmed(sym) and delta >= pump_pct:
                     if not on_cooldown(sym, "pump_fast", cd_min):
                         state = confirmer.debug_state(sym)
+
+                        # --- Capa 3: volumen relativo ---
+                        quote_vol_30s = state.get("quote_vol_30s", 0.0)
+                        quote_vol_24h = data.get("quote_vol_24h") or data.get("vol_24h") or 0.0
+                        rel_vol, rv_reason = rvf.check(sym, quote_vol_30s, quote_vol_24h)
+                        if rv_reason != "ok":
+                            log("FAST", f"rel_vol skip {sym}: {rv_reason} ({rel_vol:.2f}x)")
+                            confirmer.remove(sym)
+                            continue
+                        # --------------------------------
+
                         extras = {
                             "delta":     round(delta, 3),
                             "buy_ratio": round(state.get("buy_ratio") or 0, 2),
                             "n_trades":  state.get("n_events", 0),
+                            "rel_vol":   round(rel_vol, 2),
                             "confirmed": True,
                         }
                         alert_str = f"[{pre}] PUMP_FAST | {sym} WS @ {price:.6g} | {json.dumps(extras, separators=(',', ':'))}"

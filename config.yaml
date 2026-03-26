@@ -14,14 +14,14 @@ scanner:
 
 rules:
   enable:
-    pump_spike:       true
-    dump_spike:       true
-    breakout_up:      true
-    breakdown_down:   true
-    ema_cross_up:     true
-    ema_cross_down:   true
-    pump_early:       true   # NEW
-    breakout_up_early: true  # NEW
+    pump_spike:       false
+    dump_spike:       false
+    breakout_up:      false
+    breakdown_down:   false
+    ema_cross_up:     false
+    ema_cross_down:   false
+    pump_early:       false  # NEW
+    breakout_up_early: false  # NEW
 
   ema_len:       20
   ema_fast_len:  9
@@ -72,6 +72,16 @@ rules:
     range_lookback: 32
     buffer_pct:     0.20
     ema_confirm:    true
+
+  fast_ts:
+    poll_interval_s:  2
+    pump_pct:         0.30
+    min_vol_24h:      50000
+    cooldown_min:     5
+    confirm_ratio:    0.55
+    confirm_window_s: 30
+    confirm_ttl_s:    90
+    rel_volume_min:   3.0
 
 timeframes:
   "15m":
