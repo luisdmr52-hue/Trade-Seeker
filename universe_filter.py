@@ -187,33 +187,47 @@ def fetch_coingecko_mcap(spot_symbols: Set[str]) -> dict:
             if csymbol in bases:
                 symbol_to_ids.setdefault(csymbol, []).append(cid)
 
-        # Step 2: paginate /coins/markets
+        # Step 2: fetch mcap only for our candidates using ids param (1 request max)
+        # Collect all coin_ids relevant to our universe
+        all_ids = []
+        for base in bases:
+            all_ids.extend(symbol_to_ids.get(base, []))
+        all_ids = list(set(all_ids))  # deduplicate
+
         mcap_by_id: dict = {}
-        page = 1
-        while True:
+        # Step 2: fetch mcap only for candidate coin_ids (chunked, 200 ids/request)
+        # Only map ids for our spot_symbols -- avoids 414 URI Too Long
+        candidate_bases = {sym[:-4].lower() for sym in spot_symbols if sym.endswith('USDT')}
+        all_ids = []
+        for base in candidate_bases:
+            all_ids.extend(symbol_to_ids.get(base, []))
+        all_ids = list(set(all_ids))
+
+        mcap_by_id: dict = {}
+        n_requests = 0
+        chunk_size = 200
+        for i in range(0, max(len(all_ids), 1), chunk_size):
+            chunk = all_ids[i:i + chunk_size]
+            if not chunk:
+                break
             data = _get(
-                COINGECKO_API + "/coins/markets",
+                COINGECKO_API + '/coins/markets',
                 params={
-                    "vs_currency": "usd",
-                    "order":       "market_cap_desc",
-                    "per_page":    250,
-                    "page":        page,
-                    "sparkline":   "false",
+                    'vs_currency': 'usd',
+                    'ids':         ','.join(chunk),
+                    'per_page':    250,
+                    'sparkline':   'false',
                 },
             )
-            if not data:
-                break
-            for coin in data:
-                cid  = coin.get("id")
-                mcap = coin.get("market_cap")
-                if cid and mcap is not None:
-                    mcap_by_id[cid] = mcap
-            if len(data) < 250:
-                break  # last page
-            page += 1
-            time.sleep(CG_REQUEST_DELAY_S)
-            if page > 20:  # safety: 5000 coins max
-                break
+            n_requests += 1
+            if data:
+                for coin in data:
+                    cid  = coin.get('id')
+                    mcap = coin.get('market_cap')
+                    if cid and mcap is not None:
+                        mcap_by_id[cid] = mcap
+            if i + chunk_size < len(all_ids):
+                time.sleep(CG_REQUEST_DELAY_S)
 
         # Step 3: map back to XYZUSDT symbols
         # Multiple ids can share a ticker (e.g. "usdc") -- take highest mcap
@@ -230,7 +244,7 @@ def fetch_coingecko_mcap(spot_symbols: Set[str]) -> dict:
                 result[sym] = best_mcap
 
         _save_mcap_cache(result)
-        print(f"[UniverseFilter] CoinGecko: {len(result)} market caps fetched ({page} pages)")
+        print(f"[UniverseFilter] CoinGecko: {len(result)} market caps fetched ({n_requests} requests)")
         return result
 
     except Exception as e:
