@@ -189,11 +189,6 @@ def fetch_coingecko_mcap(spot_symbols: Set[str]) -> dict:
 
         # Step 2: fetch mcap only for our candidates using ids param (1 request max)
         # Collect all coin_ids relevant to our universe
-        all_ids = []
-        for base in bases:
-            all_ids.extend(symbol_to_ids.get(base, []))
-        all_ids = list(set(all_ids))  # deduplicate
-
         mcap_by_id: dict = {}
         # Step 2: fetch mcap only for candidate coin_ids (chunked, 200 ids/request)
         # Only map ids for our spot_symbols -- avoids 414 URI Too Long
