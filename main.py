@@ -43,7 +43,7 @@ from fast_loop import run_fast_loop
 # Constantes
 # ---------------------------------------------------------------------------
 
-BOT_VER             = "v5.0"
+BOT_VER             = "v5.1"
 BOOT_SENT           = "/run/tradeseeker.booted"   # sentinel para boot ping único
 
 SUPERVISOR_INTERVAL_S = 5      # frecuencia de check del supervisor loop
@@ -168,15 +168,45 @@ def _boot_ping(syms: List[str]) -> None:
     _boot_ping_done = True
 
 
+
+# ---------------------------------------------------------------------------
+# ProxyPool setup
+# ---------------------------------------------------------------------------
+
+def _init_proxy_pool():
+    nord_user = os.getenv("NORDVPN_SERVICE_USER", "").strip()
+    nord_pass = os.getenv("NORDVPN_SERVICE_PASS", "").strip()
+    if not nord_user or not nord_pass:
+        log("BOOT", "NORDVPN_SERVICE_USER/PASS not set — running without proxy pool")
+        return None
+    try:
+        from proxy_pool import ProxyPool
+        pool = ProxyPool(
+            nord_user=nord_user,
+            nord_pass=nord_pass,
+            env_file=os.getenv("KTS_COMPOSE_ENV", "/root/kts-lab/compose/.env"),
+            benthos_metrics_url=os.getenv("KTS_BENTHOS_METRICS", "http://localhost:4199/metrics"),
+            compose_dir=os.getenv("KTS_COMPOSE_DIR", "/root/kts-lab/compose"),
+            log_fn=log,
+        )
+        pool.start()
+        pool.enable_direct_ip()
+        log("BOOT", "ProxyPool started — direct IP slot enabled")
+        return pool
+    except Exception as e:
+        log("BOOT", f"ProxyPool init error (non-fatal): {type(e).__name__}: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Factory de fast_loop thread
 # ---------------------------------------------------------------------------
 
-def _make_fast_thread(uf: UniverseFilter) -> threading.Thread:
+def _make_fast_thread(uf: UniverseFilter, proxy_pool=None) -> threading.Thread:
     """Crea (pero no arranca) el fast_loop thread."""
     return threading.Thread(
         target=run_fast_loop,
-        args=(uf, _stop_event),
+        args=(uf, _stop_event, proxy_pool),
         daemon=True,
         name="fast-loop",
     )
@@ -213,6 +243,8 @@ def run() -> None:
         log("ERR", "no symbols resolved — aborting")
         sys.exit(2)
 
+    proxy_pool = _init_proxy_pool()
+
     # Arrancar UniverseFilter (daemon thread interno)
     uf = UniverseFilter()
     uf.start()
@@ -228,7 +260,7 @@ def run() -> None:
     _boot_ping(syms)
 
     # Arrancar fast_loop
-    fast_thread = _make_fast_thread(uf)
+    fast_thread = _make_fast_thread(uf, proxy_pool)
     fast_thread.start()
     log("BOOT", f"fast_loop thread started (name={fast_thread.name})")
 
@@ -269,7 +301,7 @@ def run() -> None:
             )
             time.sleep(RESTART_BACKOFF_S * _restart_count)   # backoff incremental
 
-            fast_thread = _make_fast_thread(uf)
+            fast_thread = _make_fast_thread(uf, proxy_pool)
             fast_thread.start()
             log("BOOT", f"fast_loop restarted (attempt {_restart_count})")
 

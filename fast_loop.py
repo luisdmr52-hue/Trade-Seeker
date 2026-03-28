@@ -106,7 +106,11 @@ def _read_confirmer_params() -> dict:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run_fast_loop(uf: UniverseFilter, stop_event: threading.Event) -> None:
+def run_fast_loop(
+    uf:         UniverseFilter,
+    stop_event: threading.Event,
+    proxy_pool=None,
+) -> None:
     """
     PUMP_FAST detection loop.
 
@@ -127,12 +131,13 @@ def run_fast_loop(uf: UniverseFilter, stop_event: threading.Event) -> None:
         ttl_s=_DEFAULT_TTL_S,
         vol_ratio=_DEFAULT_RATIO,
         log_fn=log,
+        proxy_pool=proxy_pool,
     )
     rvf = RelativeVolumeFilter(
         min_rel_volume=cfg("rules.fast_ts.rel_volume_min", _DEFAULT_REL_VOL)
     )
 
-    log("FAST", "loop started (v1.0 — modular)")
+    log("FAST", f"loop started (v1.1 — proxy={'enabled' if proxy_pool else 'disabled'})")
 
     consecutive_empty = 0
     cleanup_counter   = 0

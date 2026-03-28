@@ -25,6 +25,7 @@ Fix 2026-03-28:
 import time
 import json
 import threading
+import urllib.parse
 import websocket
 from collections import deque
 from typing import Dict, Optional
@@ -110,12 +111,14 @@ class AggTradeConfirmer:
         vol_ratio:  float = DEFAULT_VOL_RATIO,
         min_events: int   = 3,
         log_fn=None,
+        proxy_pool=None,
     ):
         self.window_s   = window_s
         self.ttl_s      = ttl_s
         self.vol_ratio  = vol_ratio
         self.min_events = min_events
-        self._log       = log_fn or (lambda tag, msg: print(f"[{tag}] {msg}"))
+        self._log        = log_fn or (lambda tag, msg: print(f"[{tag}] {msg}"))
+        self._proxy_pool = proxy_pool
         self._candidates: Dict[str, _Candidate] = {}
         self._lock = threading.Lock()
 
@@ -208,14 +211,37 @@ class AggTradeConfirmer:
             except Exception as e:
                 c.error = str(e)
 
+        proxy_url = None
+        if self._proxy_pool:
+            proxy_url = self._proxy_pool.acquire("confirmer")
+        proxy_kwargs: dict = {}
+        if proxy_url:
+            try:
+                import urllib.parse as _up
+                parsed = _up.urlparse(proxy_url)
+                proxy_kwargs = {
+                    "proxy_type":      parsed.scheme,
+                    "http_proxy_host": parsed.hostname,
+                    "http_proxy_port": parsed.port,
+                    "http_proxy_auth": (parsed.username, parsed.password),
+                }
+                self._log("CONF", f"stream {c.symbol} via proxy host={parsed.hostname}")
+            except Exception as e:
+                self._log("CONF", f"proxy parse error {c.symbol}: {e} — direct")
+                proxy_kwargs = {}
+
         def on_open(ws):
             c.connected = True
             self._log("CONF", f"stream open: {c.symbol}")
+            if self._proxy_pool:
+                self._proxy_pool.release("confirmer", success=True)
 
         def on_error(ws, error):
             c.connected = False
             c.error = str(error)
             self._log("CONF", f"stream error: {c.symbol} — {error}")
+            if self._proxy_pool:
+                self._proxy_pool.release("confirmer", success=False)
 
         def on_close(ws, code, msg):
             c.connected = False
@@ -231,7 +257,7 @@ class AggTradeConfirmer:
         c.ws = ws
         t = threading.Thread(
             target=ws.run_forever,
-            kwargs={"ping_interval": 30, "ping_timeout": 10},
+            kwargs={"ping_interval": 30, "ping_timeout": 10, **proxy_kwargs},
             daemon=True,
             name=f"aggtrade-{c.symbol}",
         )
