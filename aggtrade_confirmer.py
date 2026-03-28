@@ -1,6 +1,6 @@
 """
 aggtrade_confirmer.py — P3-B intrabar volume confirmation via aggTrade WS
-Trade Seeker v4.2
+Trade Seeker v4.2 — patched 2026-03-28
 
 Flow:
   1. Fast loop detects price spike → confirmer.add_candidate(symbol)
@@ -15,6 +15,11 @@ Design principles:
 - One stream per active candidate — no pool, no pre-warming
 - Thread-safe: uses threading.Lock for candidate dict access
 - Defensive: stream errors → logged, candidate marked degraded (not crashed)
+
+Fix 2026-03-28:
+- debug_state() now exposes quote_vol_30s (USDT volume in current window)
+  Required by fast_loop.py → RelativeVolumeFilter (Capa 3).
+  Was always computed in _Candidate but never exposed in the dict.
 """
 
 import time
@@ -73,7 +78,6 @@ class _Candidate:
         """Total USDT volume (buy + sell) in the current window."""
         self._trim()
         return sum(q for _, _, q in self.events)
-
 
     def n_events(self) -> int:
         self._trim()
@@ -164,17 +168,26 @@ class AggTradeConfirmer:
             return len(self._candidates)
 
     def debug_state(self, symbol: str) -> dict:
+        """
+        Returns a snapshot dict of the candidate's current state.
+        Includes quote_vol_30s (USDT volume in current window) —
+        required by RelativeVolumeFilter (Capa 3) in fast_loop.py.
+        """
         with self._lock:
             c = self._candidates.get(symbol)
         if c is None:
-            return {"active": False}
+            return {
+                "active":        False,
+                "quote_vol_30s": 0.0,
+            }
         return {
-            "active":     True,
-            "connected":  c.connected,
-            "n_events":   c.n_events(),
-            "buy_ratio":  c.buy_ratio(),
-            "expires_in": round(c.expires_at - time.time(), 1),
-            "error":      c.error,
+            "active":        True,
+            "connected":     c.connected,
+            "n_events":      c.n_events(),
+            "buy_ratio":     c.buy_ratio(),
+            "quote_vol_30s": c.quote_vol_30s(),   # FIX: was missing
+            "expires_in":    round(c.expires_at - time.time(), 1),
+            "error":         c.error,
         }
 
     # ------------------------------------------------------------------
