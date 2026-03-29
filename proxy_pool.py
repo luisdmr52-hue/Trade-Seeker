@@ -1040,8 +1040,7 @@ class ProxyPool:
             if not injected and "url: wss://" in line:
                 if proxy_host:
                     indent = len(line) - len(line.lstrip())
-                    proxy_line = " " * indent + f"proxy_url: socks5://{self._user}:{self._pass}@{proxy_host}:1080
-"
+                    proxy_line = " " * indent + f"proxy_url: socks5://{self._user}:{self._pass}@{proxy_host}:1080\n"
                     out_lines.append(proxy_line)
                     injected = True
 
