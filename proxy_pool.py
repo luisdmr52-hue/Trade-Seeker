@@ -182,6 +182,8 @@ class ProxyPool:
         benthos_metrics_url: str  = "http://localhost:4199/metrics",
         compose_dir:         str  = "/root/kts-lab/compose",
         log_fn                    = None,
+        base_yaml_path:      str  = "/root/kts-lab/compose/config/benthos_spot_base.yaml",
+        runtime_yaml_path:   str  = "/root/kts-lab/compose/config/benthos_spot.yaml",
     ):
         self._user = nord_user
         self._pass = nord_pass
@@ -189,6 +191,8 @@ class ProxyPool:
         self.benthos_metrics_url = benthos_metrics_url
         self.compose_dir         = compose_dir
         self._log                = log_fn or self._default_log
+        self._base_yaml_path     = base_yaml_path
+        self._runtime_yaml_path  = runtime_yaml_path
 
         # Lock exclusivo para _server_list — independiente de slots
         self._server_list_lock:  threading.Lock = threading.Lock()
@@ -961,7 +965,16 @@ class ProxyPool:
     # -----------------------------------------------------------------------
 
     def _do_benthos_restart(self):
-        """Reinicia ts_benthos_spot via Docker stop + up."""
+        """
+        1. Escribe benthos_spot.yaml (con o sin proxy_url segun slot activo).
+        2. Reinicia ts_benthos_spot via Docker stop + up.
+
+        proxy_url se inyecta ONLY si el slot benthos tiene host NordVPN activo.
+        Si el slot esta en fallback directo (host=None), se usa la base sin cambios.
+        Campo proxy_url vacio rompe gorilla/websocket — se omite completamente.
+        """
+        self._write_benthos_yaml()
+
         cmd = self._docker_cmd or ["docker", "compose"]
         try:
             self._log("POOL", "stopping ts_benthos_spot...")
@@ -992,6 +1005,65 @@ class ProxyPool:
             self._log("POOL", f"ERROR: docker command timed out ({DOCKER_TIMEOUT_S}s)")
         except Exception as e:
             self._log("POOL", f"docker restart error: {type(e).__name__}: {e}")
+
+    def _write_benthos_yaml(self):
+        """
+        Genera benthos_spot.yaml desde la plantilla base.
+
+        Si el slot benthos tiene host NordVPN activo, inserta:
+            proxy_url: socks5://user:pass@host:1080
+        inmediatamente despues de la linea que contiene 'url: wss://'.
+
+        Si no hay proxy activo (fallback directo), copia la base sin modificar.
+        Write atomico: tempfile -> os.replace para evitar YAML corrupto.
+        """
+        slot = self._slots.get("benthos")
+        proxy_host = None
+        if slot:
+            with slot.lock:
+                h  = slot.host
+                st = slot.slot_type
+            if h and st == "nordvpn":
+                proxy_host = h
+
+        try:
+            with open(self._base_yaml_path, "r") as f:
+                lines = f.readlines()
+        except Exception as e:
+            self._log("POOL", f"ERROR: cannot read base yaml {self._base_yaml_path}: {e}")
+            return
+
+        out_lines = []
+        injected = False
+        for line in lines:
+            out_lines.append(line)
+            if not injected and "url: wss://" in line:
+                if proxy_host:
+                    indent = len(line) - len(line.lstrip())
+                    proxy_line = " " * indent + f"proxy_url: socks5://{self._user}:{self._pass}@{proxy_host}:1080
+"
+                    out_lines.append(proxy_line)
+                    injected = True
+
+        if proxy_host and not injected:
+            self._log("POOL", "WARNING: 'url: wss://' not found in base yaml — proxy_url NOT injected")
+
+        runtime_dir = os.path.dirname(os.path.abspath(self._runtime_yaml_path))
+        fd, tmp_path = tempfile.mkstemp(dir=runtime_dir, prefix=".benthos_spot_tmp_")
+        try:
+            with os.fdopen(fd, "w") as tmp_f:
+                tmp_f.writelines(out_lines)
+                tmp_f.flush()
+                os.fsync(tmp_f.fileno())
+            os.replace(tmp_path, self._runtime_yaml_path)
+            mode = f"proxy={proxy_host}" if proxy_host else "direct (no proxy_url)"
+            self._log("POOL", f"benthos_spot.yaml written [{mode}]")
+        except Exception as e:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            self._log("POOL", f"ERROR: failed to write runtime yaml: {type(e).__name__}: {e}")
 
     def _verify_benthos_up(self) -> bool:
         """
