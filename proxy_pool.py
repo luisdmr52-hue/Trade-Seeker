@@ -818,69 +818,35 @@ class ProxyPool:
 
     def _refresh_server_list(self):
         """
-        Consulta NordVPN API y reconstruye el pool con servidores EU
-        ordenados por carga. Si falla, mantiene el pool anterior.
+        Carga la lista estatica de hostnames SOCKS5 de NordVPN.
+
+        NordVPN depreco el endpoint legacy_socks5_proxy de su API publica —
+        ya no devuelve servidores SOCKS5. El acceso SOCKS5 se hace via
+        hostnames estaticos oficiales documentados en support.nordvpn.com.
+
+        Se usan 4 hostnames EU unicamente. IPs US (165.231.x, 185.184.x)
+        geolocalizan en EEUU ante Binance, lo que puede causar redireccion
+        a stream.binance.us. El fallback soberano es el slot "direct" (IP VPS).
+
+        Orden de preferencia: NL especifico > NL generico > SE especifico > SE generico.
+        La "carga" es estatica (0) — NordVPN balancea internamente.
         """
-        try:
-            resp = _requests_module.get(NORD_API_URL, timeout=10)
-            resp.raise_for_status()
-            servers = resp.json()
+        static_servers = [
+            {"hostname": "amsterdam.nl.socks.nordhold.net", "load": 0, "country": "Netherlands", "name": "NordVPN NL Amsterdam"},
+            {"hostname": "nl.socks.nordhold.net",           "load": 0, "country": "Netherlands", "name": "NordVPN NL"},
+            {"hostname": "stockholm.se.socks.nordhold.net", "load": 0, "country": "Sweden",      "name": "NordVPN SE Stockholm"},
+            {"hostname": "se.socks.nordhold.net",           "load": 0, "country": "Sweden",      "name": "NordVPN SE"},
+        ]
 
-            euro: List[Dict] = []
-            for s in servers:
-                hostname = (s.get("hostname") or "").strip()
-                if not hostname:
-                    continue
-                locations = s.get("locations") or []
-                country = (
-                    locations[0].get("country", {}).get("name", "")
-                    if locations else ""
-                )
-                if country not in EURO_COUNTRIES:
-                    continue
-                load = s.get("load", 100)
-                if not isinstance(load, (int, float)):
-                    load = 100
-                euro.append({
-                    "hostname": hostname,
-                    "load":     int(load),
-                    "country":  country,
-                    "name":     s.get("name", ""),
-                })
+        with self._server_list_lock:
+            self._server_list         = static_servers
+            self._last_server_refresh = time.time()
 
-            if not euro:
-                self._log("POOL", "WARNING: no EU SOCKS5 servers — using full list")
-                for s in servers:
-                    hostname = (s.get("hostname") or "").strip()
-                    if not hostname:
-                        continue
-                    euro.append({
-                        "hostname": hostname,
-                        "load":     int(s.get("load", 100)),
-                        "country":  "",
-                        "name":     s.get("name", ""),
-                    })
-
-            if not euro:
-                self._log("POOL", "ERROR: NordVPN API returned no usable servers")
-                return
-
-            euro.sort(key=lambda x: x["load"])
-            top = euro[:TOP_N_SERVERS]
-
-            with self._server_list_lock:
-                self._server_list       = top
-                self._last_server_refresh = time.time()
-
-            self._log(
-                "POOL",
-                f"server list refreshed: {len(top)} EU servers | "
-                f"best={top[0]['hostname']} {top[0]['load']}% | "
-                f"worst={top[-1]['hostname']} {top[-1]['load']}%"
-            )
-
-        except Exception as e:
-            self._log("POOL", f"server refresh failed: {type(e).__name__}: {e}")
+        self._log(
+            "POOL",
+            f"server list loaded: {len(static_servers)} static EU hostnames "
+            f"({', '.join(s['hostname'] for s in static_servers)})"
+        )
 
     def _next_available_host(self, exclude_label: str = "") -> Optional[str]:
         """
@@ -1054,6 +1020,7 @@ class ProxyPool:
                 tmp_f.writelines(out_lines)
                 tmp_f.flush()
                 os.fsync(tmp_f.fileno())
+            os.chmod(tmp_path, 0o644)
             os.replace(tmp_path, self._runtime_yaml_path)
             mode = f"proxy={proxy_host}" if proxy_host else "direct (no proxy_url)"
             self._log("POOL", f"benthos_spot.yaml written [{mode}]")
