@@ -37,6 +37,8 @@ from typing import List, Optional
 import outcome_tracker
 from utils import log, load_config, cfg, tg_ping
 from universe_filter import UniverseFilter
+from coverage_universe_builder import CoverageUniverseBuilder
+from benthos_runtime import BenthosRuntime
 from fast_loop import run_fast_loop
 
 # ---------------------------------------------------------------------------
@@ -169,6 +171,43 @@ def _boot_ping(syms: List[str]) -> None:
 
 
 
+
+# ---------------------------------------------------------------------------
+# BenthosRuntime setup
+# ---------------------------------------------------------------------------
+
+def _init_benthos_runtime(cub: "CoverageUniverseBuilder"):
+    from utils import cfg
+    bt_cfg     = cfg("benthos_runtime", {})
+    compose_dir = bt_cfg.get("compose_dir", "/root/kts-lab/compose")
+    base_yaml   = bt_cfg.get("base_yaml",   "config/benthos_spot_base.yaml")
+    runtime_yaml = bt_cfg.get("runtime_yaml", "config/benthos_spot.yaml")
+    metrics_url  = bt_cfg.get("metrics_url",  "http://localhost:4199/metrics")
+    verify_timeout_s = bt_cfg.get("verify_timeout_s", 60)
+
+    proxy_url = None
+    nord_proxy = os.getenv("NORDVPN_PROXY", "").strip()
+    if nord_proxy:
+        proxy_url = nord_proxy
+
+    rt = BenthosRuntime(
+        compose_dir               = compose_dir,
+        base_yaml_path            = base_yaml,
+        runtime_yaml_path         = runtime_yaml,
+        metrics_url               = metrics_url,
+        log_fn                    = log,
+        get_coverage_universe_fn  = cub.get_coverage_universe,
+        get_coverage_signature_fn = cub.get_coverage_signature,
+        proxy_url                 = proxy_url,
+        verify_timeout_s          = verify_timeout_s,
+    )
+    result = rt.apply_if_changed()
+    if result["status"] == "failed":
+        log("BOOT", f"BenthosRuntime failed ({result.get('reason')}) — continuing in degraded mode")
+    else:
+        log("BOOT", f"BenthosRuntime: {result}")
+    return rt
+
 # ---------------------------------------------------------------------------
 # ProxyPool setup
 # ---------------------------------------------------------------------------
@@ -242,6 +281,15 @@ def run() -> None:
     if not syms:
         log("ERR", "no symbols resolved — aborting")
         sys.exit(2)
+
+    # Construir coverage universe (bloqueante)
+    cub = CoverageUniverseBuilder()
+    cub.refresh()
+    cub.start()
+    log("BOOT", f"CoverageUniverseBuilder ready — {len(cub.get_coverage_universe())} symbols")
+
+    # Arrancar BenthosRuntime (feed base — DC-FEED-08: fallo = modo degradado)
+    _init_benthos_runtime(cub)
 
     proxy_pool = _init_proxy_pool()
 
