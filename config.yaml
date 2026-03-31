@@ -76,7 +76,7 @@ rules:
   fast_ts:
     poll_interval_s:  2
     pump_pct:         0.30
-    min_vol_24h:      50000
+    min_vol_24h:      200000
     cooldown_min:     5
     confirm_ratio:    0.55
     confirm_window_s: 30
@@ -120,3 +120,18 @@ logging:
   level:     "INFO"
   to_file:   false
   file_path: "/root/trade-seeker/logs/bot.log"
+
+coverage_universe:
+  min_quote_vol_24h_usd: 200000
+  min_trade_count_24h:   500
+  rebuild_interval_h:    6
+  extra_stable_pairs:
+    - "USD1USDT"
+    - "RLUSDUSDT"
+
+benthos_runtime:
+  compose_dir:      "/root/kts-lab/compose"
+  base_yaml:        "config/benthos_spot_base.yaml"
+  runtime_yaml:     "config/benthos_spot.yaml"
+  metrics_url:      "http://localhost:4199/metrics"
+  verify_timeout_s: 60

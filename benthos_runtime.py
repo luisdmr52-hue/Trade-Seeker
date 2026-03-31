@@ -81,7 +81,10 @@ class BenthosRuntime:
 
     def apply_if_changed(self) -> dict:
         """
-        Main entry point. Idempotent — skips restart if nothing changed.
+        Main entry point. Idempotent.
+
+        Boot behavior: if feed is already live, skip restart entirely.
+        Periodic behavior (6h): restart only if signature changed.
 
         Returns:
             {"status": "ok"|"skipped"|"failed", "reason": str, ...}
@@ -90,6 +93,14 @@ class BenthosRuntime:
             universe = self._get_universe()
             if not universe:
                 return {"status": "failed", "reason": "empty_coverage_universe"}
+
+            # If feed is already live — skip restart regardless of signature
+            if self._is_feed_live():
+                runtime_sig = self._compute_runtime_signature(universe)
+                self._last_applied_sig = runtime_sig
+                self._log("BenthosRuntime", "feed already live — skipping restart")
+                return {"status": "skipped", "reason": "feed_already_live",
+                        "signature": runtime_sig[:12]}
 
             runtime_sig = self._compute_runtime_signature(universe)
 
@@ -209,6 +220,16 @@ class BenthosRuntime:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _is_feed_live(self) -> bool:
+        """Quick check — returns True if input_received > 0 right now."""
+        try:
+            r = requests.get(self._metrics_url, timeout=5)
+            if r.status_code == 200:
+                return self._parse_input_received(r.text) > 0
+        except Exception:
+            pass
+        return False
 
     def _compute_runtime_signature(self, universe: List[str]) -> str:
         proxy_component = self._proxy_url or "direct"

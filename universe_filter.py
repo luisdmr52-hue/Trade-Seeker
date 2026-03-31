@@ -40,7 +40,7 @@ BINANCE_DAPI  = "https://dapi.binance.com"
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 
 # Watchlist criteria
-DEFAULT_MIN_VOL_24H  =    100_000   # USDT -- minimum liquidity
+DEFAULT_MIN_VOL_24H  =    200_000   # USDT -- minimum liquidity
 DEFAULT_MAX_VOL_24H  =  5_000_000   # USDT -- above this -> too liquid / large cap
 DEFAULT_MAX_MCAP     = 50_000_000   # USD  -- CoinGecko market cap ceiling
 DORMANCY_PERCENTILE  = 25           # vol_24h < pct25 of ALL USDT universe -> dormant
