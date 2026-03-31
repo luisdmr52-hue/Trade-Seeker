@@ -186,9 +186,13 @@ def _init_benthos_runtime(cub: "CoverageUniverseBuilder"):
     verify_timeout_s = bt_cfg.get("verify_timeout_s", 60)
 
     proxy_url = None
-    nord_proxy = os.getenv("NORDVPN_PROXY", "").strip()
-    if nord_proxy:
-        proxy_url = nord_proxy
+    nord_user = os.getenv("NORDVPN_SERVICE_USER", "").strip()
+    nord_pass = os.getenv("NORDVPN_SERVICE_PASS", "").strip()
+    if nord_user and nord_pass:
+        proxy_url = f"socks5://{nord_user}:{nord_pass}@nl.socks.nordhold.net:1080"
+        log("BOOT", "BenthosRuntime: proxy configured (nl.socks.nordhold.net)")
+    else:
+        log("BOOT", "BenthosRuntime: no proxy credentials — using direct IP")
 
     rt = BenthosRuntime(
         compose_dir               = compose_dir,
@@ -291,7 +295,7 @@ def run() -> None:
     # Arrancar BenthosRuntime (feed base — DC-FEED-08: fallo = modo degradado)
     _init_benthos_runtime(cub)
 
-    proxy_pool = _init_proxy_pool()
+    proxy_pool = None  # DC-FEED-07: ProxyPool apagado — BenthosRuntime maneja el proxy
 
     # Arrancar UniverseFilter (daemon thread interno)
     uf = UniverseFilter()

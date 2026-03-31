@@ -135,6 +135,9 @@ def _build(extra_stable_pairs: frozenset = frozenset()) -> List[str]:
             counters["low_trades"] += 1
             continue
 
+        # Exclude non-ASCII symbols — Bento YAML parser rejects them
+        if not sym.isascii():
+            continue
         result.append(sym)
         counters["accepted"] += 1
 
