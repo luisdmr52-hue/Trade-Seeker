@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 fast_loop.py — KTS TradeSeeker PUMP_FAST detection loop
-v1.0 — 2026-03-28
+v1.2 — 2026-03-31
 
 Extracted from main.py (v4.2) — run_fast_loop() now lives here.
 Depends on: utils.py, ts_feed.py, aggtrade_confirmer.py,
-            universe_filter.py, volume_filter.py, outcome_tracker.py
+            universe_filter.py, volume_filter.py, outcome_tracker.py,
+            entry_gate.py
 
 Design:
 - One function: run_fast_loop(uf, stop_event)
@@ -16,13 +17,29 @@ Design:
 - Cleanup periodic: confirmer.cleanup_expired() every CLEANUP_EVERY cycles
 - Cooldowns and dedup: via utils.on_cooldown / mark_cooldown
 
+Capa 5 (entry gate) — v1.1 — 2026-03-31:
+- Rule 1 (timing): stage_pct > stage_pct_max → reject "late_entry"
+- Rule 2 (buy_ratio): desactivada — cubierta upstream por is_confirmed()
+- Rule 3 (persistencia): bloqueada — DC-C5-01
+- _trigger_prices: dict[str, float] tracks price_at_trigger per candidate.
+  Populated on spike detection, cleared on ALL candidate exit paths:
+    - cooldown gate     → pop (precio viejo no aplica post-cooldown)
+    - rel_vol reject    → pop + confirmer.remove()
+    - entry_gate error  → pop + confirmer.remove()
+    - entry_gate reject → pop + confirmer.remove()
+    - alert emitted     → pop + confirmer.remove()
+    - cleanup_expired   → synced via confirmer.active_candidates()
+
 Flow per cycle:
   1. load_config()
   2. get_snapshot() from Timescale
   3. Validate snapshot freshness
   4. Filter by universe (UniverseFilter)
   5. For each symbol: compute delta, add to confirmer if spike detected
-  6. If confirmer.is_confirmed(sym): check rel_vol (Capa 3) → alert
+  6. If confirmer.is_confirmed(sym):
+       a. check rel_vol (Capa 3)
+       b. entry_gate.evaluate() (Capa 5)
+       c. alert if accepted
   7. tg_send() + outcome_tracker.record() + mark_cooldown()
   8. sleep(poll_interval - elapsed)
 """
@@ -33,6 +50,7 @@ import threading
 from typing import List, Optional
 
 import outcome_tracker
+import entry_gate
 from utils import log, load_config, cfg, tg_send, on_cooldown, mark_cooldown
 from ts_feed import TSFeed, PriceTracker
 from aggtrade_confirmer import AggTradeConfirmer
@@ -51,6 +69,7 @@ _DEFAULT_RATIO     = 0.60
 _DEFAULT_WINDOW_S  = 30
 _DEFAULT_TTL_S     = 90
 _DEFAULT_REL_VOL   = 3.0
+_DEFAULT_STAGE_MAX = 4.0
 
 # Snapshot older than this is treated as stale → cycle skipped
 _STALE_THRESHOLD_S = 15
@@ -77,7 +96,6 @@ def _snapshot_age_s(snapshot: dict) -> Optional[float]:
         ts = data.get("ts")
         if ts is None:
             continue
-        # psycopg2 returns datetime objects for TIMESTAMPTZ columns
         try:
             if hasattr(ts, "timestamp"):
                 epoch = ts.timestamp()
@@ -137,7 +155,12 @@ def run_fast_loop(
         min_rel_volume=cfg("rules.fast_ts.rel_volume_min", _DEFAULT_REL_VOL)
     )
 
-    log("FAST", f"loop started (v1.1 — proxy={'enabled' if proxy_pool else 'disabled'})")
+    # Capa 5 — price at trigger per candidate
+    # key: symbol, value: price when delta >= pump_pct was first detected
+    # Cleared on ALL candidate exit paths — see module docstring.
+    _trigger_prices: dict = {}
+
+    log("FAST", f"loop started (v1.2 — proxy={'enabled' if proxy_pool else 'disabled'})")
 
     consecutive_empty = 0
     cleanup_counter   = 0
@@ -147,13 +170,20 @@ def run_fast_loop(
         # ── 1. Config hot-reload ─────────────────────────────────────────
         load_config()
 
-        poll_s    = float(cfg("rules.fast_ts.poll_interval_s", _DEFAULT_POLL_S))
-        pump_pct  = float(cfg("rules.fast_ts.pump_pct",         _DEFAULT_PUMP_PCT))
-        min_vol   = float(cfg("rules.fast_ts.min_vol_24h",      _DEFAULT_MIN_VOL))
-        cd_min    = int(  cfg("rules.fast_ts.cooldown_min",     _DEFAULT_CD_MIN))
-        throttle  = max(0.0, float(cfg("telegram.throttle_sec", 2.0)))
-        prefix    = cfg("telegram.prefix", "TS")
-        rel_vol_min = float(cfg("rules.fast_ts.rel_volume_min", _DEFAULT_REL_VOL))
+        poll_s      = float(cfg("rules.fast_ts.poll_interval_s", _DEFAULT_POLL_S))
+        pump_pct    = float(cfg("rules.fast_ts.pump_pct",         _DEFAULT_PUMP_PCT))
+        min_vol     = float(cfg("rules.fast_ts.min_vol_24h",      _DEFAULT_MIN_VOL))
+        cd_min      = int(  cfg("rules.fast_ts.cooldown_min",     _DEFAULT_CD_MIN))
+        throttle    = max(0.0, float(cfg("telegram.throttle_sec", 2.0)))
+        prefix      = cfg("telegram.prefix", "TS")
+        rel_vol_min = float(cfg("rules.fast_ts.rel_volume_min",   _DEFAULT_REL_VOL))
+        stage_max   = float(cfg("rules.fast_ts.stage_pct_max",    _DEFAULT_STAGE_MAX))
+
+        # Validate stage_max from config — hot-reload could set invalid value
+        if stage_max <= 0:
+            log("FAST", f"WARNING: stage_pct_max={stage_max} inválido — "
+                        f"usando default {_DEFAULT_STAGE_MAX}")
+            stage_max = _DEFAULT_STAGE_MAX
 
         # Sync confirmer params with current config (cheap attribute set)
         params = _read_confirmer_params()
@@ -227,13 +257,16 @@ def run_fast_loop(
             if delta is None:
                 continue
 
-            # Spike detected → open aggTrade stream for confirmation
+            # Spike detected → open aggTrade stream + record trigger price
             if delta >= pump_pct:
                 try:
                     confirmer.add_candidate(sym)
                 except Exception as e:
                     log("FAST", f"ERROR add_candidate {sym}: {type(e).__name__}: {e}")
                     continue
+                # Only record on first detection — do not overwrite if already active
+                if sym not in _trigger_prices:
+                    _trigger_prices[sym] = price
 
             # Check if already confirmed
             try:
@@ -245,27 +278,69 @@ def run_fast_loop(
             if not confirmed or delta < pump_pct:
                 continue
 
-            # Cooldown gate
+            # Cooldown gate — pop trigger price so next firing uses fresh p0
             if on_cooldown(sym, "pump_fast", cd_min):
+                _trigger_prices.pop(sym, None)
                 continue
 
             # ── Capa 3: volumen relativo ─────────────────────────────────
             try:
                 state = confirmer.debug_state(sym)
                 quote_vol_30s = state.get("quote_vol_30s", 0.0)
-
-                # Use quote_vol_24h for correct USDT units (Capa 3 requirement)
                 quote_vol_24h = data.get("quote_vol_24h") or data.get("vol_24h") or 0.0
-
                 rel_vol, rv_reason = rvf.check(sym, quote_vol_30s, quote_vol_24h)
             except Exception as e:
                 log("FAST", f"ERROR rel_vol check {sym}: {type(e).__name__}: {e}")
                 confirmer.remove(sym)
+                _trigger_prices.pop(sym, None)
                 continue
 
             if rv_reason != "ok":
                 log("FAST", f"rel_vol skip {sym}: {rv_reason} ({rel_vol:.2f}x)")
                 confirmer.remove(sym)
+                _trigger_prices.pop(sym, None)
+                continue
+
+            # ── Capa 5: entry gate ───────────────────────────────────────
+            price_at_trigger = _trigger_prices.get(sym)
+
+            if price_at_trigger is None:
+                # Trigger price missing — conservative fallback: allow signal
+                # Happens if candidate was added before v1.2 (e.g. on restart)
+                log("FAST", f"WARN entry_gate {sym}: no trigger price — gate skipped")
+                gate_accepted    = True
+                gate_result_dict = {"stage_pct": None, "pass_reason": "no_trigger_price"}
+            else:
+                try:
+                    gate = entry_gate.evaluate(
+                        price_at_trigger=price_at_trigger,
+                        price_at_confirm=price,
+                        stage_pct_max=stage_max,
+                    )
+                    gate_accepted    = gate.accepted
+                    gate_result_dict = {
+                        "stage_pct":        gate.stage_pct,
+                        "rejection_reason": gate.rejection_reason,
+                        "pass_reason":      gate.pass_reason,
+                    }
+                except ValueError as e:
+                    log("FAST", f"ERROR entry_gate {sym}: {e} — skipping")
+                    confirmer.remove(sym)
+                    _trigger_prices.pop(sym, None)
+                    continue
+                except Exception as e:
+                    log("FAST", f"ERROR entry_gate {sym}: {type(e).__name__}: {e} — skipping")
+                    confirmer.remove(sym)
+                    _trigger_prices.pop(sym, None)
+                    continue
+
+            if not gate_accepted:
+                log("FAST",
+                    f"entry_gate REJECT {sym}: "
+                    f"reason={gate_result_dict.get('rejection_reason')} "
+                    f"stage_pct={gate_result_dict.get('stage_pct')}")
+                confirmer.remove(sym)
+                _trigger_prices.pop(sym, None)
                 continue
 
             # ── Build alert ──────────────────────────────────────────────
@@ -274,6 +349,7 @@ def run_fast_loop(
                 "buy_ratio": round(state.get("buy_ratio") or 0.0, 2),
                 "n_trades":  state.get("n_events", 0),
                 "rel_vol":   round(rel_vol, 2),
+                "stage_pct": gate_result_dict.get("stage_pct"),
                 "confirmed": True,
             }
             alert_str = (
@@ -282,6 +358,7 @@ def run_fast_loop(
             )
             confirmed_alerts.append((sym, alert_str, price, extras))
             confirmer.remove(sym)
+            _trigger_prices.pop(sym, None)
 
         # ── 7. Emit alerts ───────────────────────────────────────────────
         query_ms = (time.monotonic() - cycle_start) * 1000
@@ -308,6 +385,14 @@ def run_fast_loop(
                 confirmer.cleanup_expired()
             except Exception as e:
                 log("FAST", f"ERROR cleanup_expired: {type(e).__name__}: {e}")
+
+            # Sync _trigger_prices — remove entries for candidates no longer active
+            try:
+                active = confirmer.active_candidates()
+                _trigger_prices = {s: p for s, p in _trigger_prices.items() if s in active}
+            except Exception as e:
+                log("FAST", f"ERROR trigger_prices sync: {type(e).__name__}: {e}")
+
             cleanup_counter = 0
 
         # ── 9. Sleep remainder of poll interval (interruptible) ──────────
