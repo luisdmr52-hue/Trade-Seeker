@@ -231,14 +231,18 @@ def run_fast_loop(
 
         # ── 5b. Time of day gate (Capa 4) ──────────────────────────────────
         tod = time_gate.evaluate_now()
-        if tod["blocked"]:
-            log("FAST", f"tod block regime={tod['regime']} utc_hour={tod['utc_hour']}")
+        if tod["reason"] == "fail_open":
+            log("FAST", "tod fail_open — gate skipped (fail-open)")
+        elif tod["blocked"]:
+            log("FAST",
+                f"tod block (reason={tod['reason']}, "
+                f"local_hour={tod['local_hour']}, regime={tod['market_regime']})")
             stop_event.wait(timeout=poll_s)
             continue
-        if tod["reason"] == "fail_open":
-            log("FAST", "tod fail_open — gate skipped")
-        elif tod["regime"] == "caution":
-            log("FAST", f"tod regime=caution utc_hour={tod['utc_hour']}")
+        else:
+            log("FAST",
+                f"tod allow (local_hour={tod['local_hour']}, "
+                f"regime={tod['market_regime']})")
 
         # ── 6. Per-symbol processing ─────────────────────────────────────
         confirmed_alerts: List[tuple] = []
@@ -275,6 +279,23 @@ def run_fast_loop(
             if delta >= pump_pct:
                 if dtf.is_downtrend(sym):
                     log("FAST", f"downtrend skip {sym}")
+                    continue
+                # Capa 4 — near-miss nocturno: loggear y registrar aunque no opere
+                if tod["blocked"]:
+                    log("FAST",
+                        f"tod near-miss {sym} delta={delta:.3f}% "
+                        f"regime={tod['market_regime']} local_hour={tod['local_hour']}")
+                    try:
+                        outcome_tracker.record(sym, "PUMP_FAST_SLEEP", price, {
+                            "delta":           round(delta, 3),
+                            "market_regime":   tod["market_regime"],
+                            "operator_window": tod["operator_window"],
+                            "local_hour":      tod["local_hour"],
+                            "utc_hour":        tod["utc_hour"],
+                            "operator_sleep":  True,
+                        })
+                    except Exception as e:
+                        log("FAST", f"ERROR outcome_tracker near-miss {sym}: {type(e).__name__}: {e}")
                     continue
                 try:
                     confirmer.add_candidate(sym)

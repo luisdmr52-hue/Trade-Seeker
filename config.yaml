@@ -141,3 +141,5 @@ time_gates:
   normal_hours_utc:     [8, 9, 10, 11, 12, 13]
   caution_hours_utc:    [18, 19]
   pause_hours_utc:      [20, 21, 22]
+  operator_awake_start: 8
+  operator_awake_end:   22

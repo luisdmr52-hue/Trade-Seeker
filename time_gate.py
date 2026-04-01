@@ -1,9 +1,10 @@
 """
-time_gate.py — Capa 4: Time of Day Gate
+time_gate.py — Capa 4: Time Policy Layer
 Kryptos Trade Seeker · F1
 
-Filtra ciclos de detección según la hora UTC. Gate operativo barato
-que evita abrir candidatos en ventanas de baja liquidez.
+Separa contexto de mercado (market_regime) de disponibilidad del operador
+(operator_window). El operador es human-in-the-loop — la decisión de bloquear
+depende PRIMERO del operador, no del mercado.
 
 Interfaz pública:
     evaluate_hour(utc_hour: int) -> dict   # lógica pura (SoT)
@@ -11,19 +12,29 @@ Interfaz pública:
 
 Output:
     {
-        "utc_hour": int | None,
-        "regime":   "aggressive" | "normal" | "caution" | "pause" | "low_activity" | "unknown",
-        "action":   "allow" | "block",
-        "blocked":  bool,
-        "reason":   "allowed_window" | "pause_window" | "low_activity_window" | "fail_open",
+        "utc_hour":        int | None,
+        "local_hour":      int | None,
+        "market_regime":   "aggressive" | "normal" | "caution" | "pause" | "low_activity" | "unknown",
+        "operator_window": "awake" | "sleep" | "unknown",
+        "blocked":         bool,
+        "reason":          "operator_sleep" | "allowed_window" | "fail_open",
     }
 
-Política:
-    aggressive   -> allow
-    normal       -> allow
-    caution      -> allow  (log de ciclo en fast_loop — no por símbolo)
-    pause        -> block
-    low_activity -> block
+Política F1:
+    operator_window == "sleep"  -> blocked=True,  reason="operator_sleep"
+    operator_window == "awake"  -> blocked=False, reason="allowed_window"
+    market_regime NO bloquea en F1 — solo etiqueta para calibración futura.
+
+Operator window (Caracas, UTC-4):
+    awake: 08:00–22:59
+    sleep: 23:00–07:59
+
+Market regime (UTC):
+    aggressive:   {14, 15, 16, 17}
+    normal:       {8..13}
+    caution:      {18, 19}
+    pause:        {20, 21, 22}
+    low_activity: resto
 
 Config (config.yaml):
     time_gates:
@@ -31,23 +42,31 @@ Config (config.yaml):
         normal_hours_utc:     [8, 9, 10, 11, 12, 13]
         caution_hours_utc:    [18, 19]
         pause_hours_utc:      [20, 21, 22]
+        operator_awake_start: 8    # hora local Caracas (UTC-4)
+        operator_awake_end:   22   # inclusive
 
-    Si la key no existe o viene inválida → defaults hardcodeados.
-    El módulo nunca lanza excepción hacia el caller — fail-open siempre.
+    Si falta la key → defaults hardcodeados.
+    El módulo nunca lanza excepción — fail-open siempre.
 
 Fail-open:
-    evaluate_now() captura cualquier excepción, incluyendo fallos en
-    _build_sets() / cfg(). El caller detecta reason=="fail_open" y loggea.
+    evaluate_now() captura toda excepción incluyendo fallos en _build_sets()
+    o cfg(). El caller detecta reason=="fail_open" y loggea.
 
 Thread-safe: sí (función pura, sin estado mutable).
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from utils import cfg
 
 # ---------------------------------------------------------------------------
-# Defaults hardcodeados — fallback si config.yaml no tiene time_gates
+# Timezone — Caracas es UTC-4 fijo (sin DST)
+# ---------------------------------------------------------------------------
+
+_TZ_CARACAS = timezone(timedelta(hours=-4))
+
+# ---------------------------------------------------------------------------
+# Defaults hardcodeados
 # ---------------------------------------------------------------------------
 
 _DEFAULT_AGGRESSIVE: frozenset = frozenset({14, 15, 16, 17})
@@ -55,13 +74,16 @@ _DEFAULT_NORMAL:     frozenset = frozenset({8, 9, 10, 11, 12, 13})
 _DEFAULT_CAUTION:    frozenset = frozenset({18, 19})
 _DEFAULT_PAUSE:      frozenset = frozenset({20, 21, 22})
 
-# Resultado de fallback cuando evaluate_now() no puede operar
+_DEFAULT_AWAKE_START: int = 8   # 08:00 Caracas
+_DEFAULT_AWAKE_END:   int = 22  # 22:59 Caracas (inclusive)
+
 _FAIL_OPEN_RESULT: dict = {
-    "utc_hour": None,
-    "regime":   "unknown",
-    "action":   "allow",
-    "blocked":  False,
-    "reason":   "fail_open",
+    "utc_hour":        None,
+    "local_hour":      None,
+    "market_regime":   "unknown",
+    "operator_window": "unknown",
+    "blocked":         False,
+    "reason":          "fail_open",
 }
 
 # ---------------------------------------------------------------------------
@@ -69,11 +91,7 @@ _FAIL_OPEN_RESULT: dict = {
 # ---------------------------------------------------------------------------
 
 def _load_hour_set(key: str, default: frozenset) -> frozenset:
-    """
-    Lee una lista de horas desde config.yaml.
-    Valida que todos los valores sean enteros 0-23.
-    Retorna el default si la key no existe, está vacía, o contiene inválidos.
-    """
+    """Lee lista de horas desde config. Valida rango 0-23. Fallback a default."""
     raw = cfg(f"time_gates.{key}", None)
     if raw is None:
         return default
@@ -88,77 +106,89 @@ def _load_hour_set(key: str, default: frozenset) -> frozenset:
         return default
 
 
+def _load_int(key: str, default: int) -> int:
+    """Lee un entero desde config. Valida rango 0-23. Fallback a default."""
+    raw = cfg(f"time_gates.{key}", None)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+        if 0 <= val <= 23:
+            return val
+        return default
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_sets() -> tuple:
-    """Construye los sets de horas desde config con fallback a defaults."""
-    aggressive = _load_hour_set("aggressive_hours_utc", _DEFAULT_AGGRESSIVE)
-    normal     = _load_hour_set("normal_hours_utc",     _DEFAULT_NORMAL)
-    caution    = _load_hour_set("caution_hours_utc",    _DEFAULT_CAUTION)
-    pause      = _load_hour_set("pause_hours_utc",      _DEFAULT_PAUSE)
-    return aggressive, normal, caution, pause
+    """Construye sets de horas y parámetros de operador desde config."""
+    aggressive   = _load_hour_set("aggressive_hours_utc", _DEFAULT_AGGRESSIVE)
+    normal       = _load_hour_set("normal_hours_utc",     _DEFAULT_NORMAL)
+    caution      = _load_hour_set("caution_hours_utc",    _DEFAULT_CAUTION)
+    pause        = _load_hour_set("pause_hours_utc",      _DEFAULT_PAUSE)
+    awake_start  = _load_int("operator_awake_start",      _DEFAULT_AWAKE_START)
+    awake_end    = _load_int("operator_awake_end",        _DEFAULT_AWAKE_END)
+    return aggressive, normal, caution, pause, awake_start, awake_end
 
 
 # ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 
-def evaluate_hour(utc_hour: int) -> dict:
+def evaluate_hour(utc_hour: int, local_hour: int) -> dict:
     """
     Lógica pura de clasificación. SoT del gate.
-    Protegida internamente — si _build_sets() falla, propaga la excepción
-    hacia evaluate_now() donde está el handler de fail-open.
+    Cualquier excepción en _build_sets() burbujea hacia evaluate_now().
 
     Args:
-        utc_hour: hora entera 0-23 en UTC.
+        utc_hour:   hora entera 0-23 en UTC.
+        local_hour: hora entera 0-23 en Caracas (UTC-4).
 
     Returns:
-        dict con utc_hour, regime, action, blocked, reason.
+        dict con contrato completo.
     """
-    aggressive, normal, caution, pause = _build_sets()
+    aggressive, normal, caution, pause, awake_start, awake_end = _build_sets()
 
+    # market_regime — basado en UTC
     if utc_hour in aggressive:
-        regime = "aggressive"
+        market_regime = "aggressive"
     elif utc_hour in normal:
-        regime = "normal"
+        market_regime = "normal"
     elif utc_hour in caution:
-        regime = "caution"
+        market_regime = "caution"
     elif utc_hour in pause:
-        regime = "pause"
+        market_regime = "pause"
     else:
-        regime = "low_activity"
+        market_regime = "low_activity"
 
-    blocked = regime in ("pause", "low_activity")
-    action  = "block" if blocked else "allow"
-
-    if regime == "pause":
-        reason = "pause_window"
-    elif regime == "low_activity":
-        reason = "low_activity_window"
+    # operator_window — basado en hora local Caracas
+    if awake_start <= local_hour <= awake_end:
+        operator_window = "awake"
     else:
-        reason = "allowed_window"
+        operator_window = "sleep"
+
+    # decisión de bloqueo — operator_window manda en F1
+    blocked = operator_window == "sleep"
+    reason  = "operator_sleep" if blocked else "allowed_window"
 
     return {
-        "utc_hour": utc_hour,
-        "regime":   regime,
-        "action":   action,
-        "blocked":  blocked,
-        "reason":   reason,
+        "utc_hour":        utc_hour,
+        "local_hour":      local_hour,
+        "market_regime":   market_regime,
+        "operator_window": operator_window,
+        "blocked":         blocked,
+        "reason":          reason,
     }
 
 
 def evaluate_now() -> dict:
     """
-    Wrapper UTC. Obtiene la hora actual en UTC y delega a evaluate_hour().
-
-    Captura cualquier excepción — incluyendo fallos en _build_sets() o cfg()
-    que burbujean desde evaluate_hour(). Retorna _FAIL_OPEN_RESULT en ese caso.
-    El caller (fast_loop.py) es responsable de detectar reason=="fail_open"
-    y loggear — este módulo no tiene side effects de logging.
-
-    Returns:
-        dict con el contrato estándar. Nunca lanza.
+    Wrapper UTC+Caracas. Nunca lanza — fail-open si algo falla.
+    El caller detecta reason=="fail_open" y loggea.
     """
     try:
-        utc_hour = datetime.now(timezone.utc).hour
-        return evaluate_hour(utc_hour)
+        now_utc   = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone(_TZ_CARACAS)
+        return evaluate_hour(now_utc.hour, now_local.hour)
     except Exception:
         return _FAIL_OPEN_RESULT
