@@ -167,6 +167,7 @@ def run_fast_loop(
 
     consecutive_empty = 0
     cleanup_counter   = 0
+    _tod_last_sig     = None  # (blocked, market_regime, operator_window) — anti-spam log
 
     while not stop_event.is_set():
 
@@ -231,18 +232,22 @@ def run_fast_loop(
 
         # ── 5b. Time of day gate (Capa 4) ──────────────────────────────────
         tod = time_gate.evaluate_now()
-        if tod["reason"] == "fail_open":
-            log("FAST", "tod fail_open — gate skipped (fail-open)")
-        elif tod["blocked"]:
-            log("FAST",
-                f"tod block (reason={tod['reason']}, "
-                f"local_hour={tod['local_hour']}, regime={tod['market_regime']})")
+        _tod_sig = (tod["blocked"], tod["market_regime"], tod["operator_window"])
+        if _tod_sig != _tod_last_sig:
+            if tod["reason"] == "fail_open":
+                log("FAST", "tod fail_open — gate skipped (fail-open)")
+            elif tod["blocked"]:
+                log("FAST",
+                    f"tod block (reason={tod['reason']}, "
+                    f"local_hour={tod['local_hour']}, regime={tod['market_regime']})")
+            else:
+                log("FAST",
+                    f"tod allow (local_hour={tod['local_hour']}, "
+                    f"regime={tod['market_regime']})")
+            _tod_last_sig = _tod_sig
+        if tod["blocked"]:
             stop_event.wait(timeout=poll_s)
             continue
-        else:
-            log("FAST",
-                f"tod allow (local_hour={tod['local_hour']}, "
-                f"regime={tod['market_regime']})")
 
         # ── 6. Per-symbol processing ─────────────────────────────────────
         confirmed_alerts: List[tuple] = []
