@@ -57,6 +57,7 @@ from aggtrade_confirmer import AggTradeConfirmer
 from universe_filter import UniverseFilter
 from volume_filter import RelativeVolumeFilter
 from downtrend_filter import DowntrendFilter
+import time_gate
 
 # ---------------------------------------------------------------------------
 # Constants — defaults used when config key is missing
@@ -227,6 +228,17 @@ def run_fast_loop(
 
         # ── 5. Universe filter ───────────────────────────────────────────
         universe = set(uf.get_universe())
+
+        # ── 5b. Time of day gate (Capa 4) ──────────────────────────────────
+        tod = time_gate.evaluate_now()
+        if tod["blocked"]:
+            log("FAST", f"tod block regime={tod['regime']} utc_hour={tod['utc_hour']}")
+            stop_event.wait(timeout=poll_s)
+            continue
+        if tod["reason"] == "fail_open":
+            log("FAST", "tod fail_open — gate skipped")
+        elif tod["regime"] == "caution":
+            log("FAST", f"tod regime=caution utc_hour={tod['utc_hour']}")
 
         # ── 6. Per-symbol processing ─────────────────────────────────────
         confirmed_alerts: List[tuple] = []

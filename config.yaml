@@ -135,3 +135,9 @@ benthos_runtime:
   runtime_yaml:     "config/benthos_spot.yaml"
   metrics_url:      "http://localhost:4199/metrics"
   verify_timeout_s: 60
+
+time_gates:
+  aggressive_hours_utc: [14, 15, 16, 17]
+  normal_hours_utc:     [8, 9, 10, 11, 12, 13]
+  caution_hours_utc:    [18, 19]
+  pause_hours_utc:      [20, 21, 22]
