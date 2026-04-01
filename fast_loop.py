@@ -56,6 +56,7 @@ from ts_feed import TSFeed, PriceTracker
 from aggtrade_confirmer import AggTradeConfirmer
 from universe_filter import UniverseFilter
 from volume_filter import RelativeVolumeFilter
+from downtrend_filter import DowntrendFilter
 
 # ---------------------------------------------------------------------------
 # Constants — defaults used when config key is missing
@@ -151,6 +152,7 @@ def run_fast_loop(
         log_fn=log,
         proxy_pool=proxy_pool,
     )
+    dtf = DowntrendFilter()
     rvf = RelativeVolumeFilter(
         min_rel_volume=cfg("rules.fast_ts.rel_volume_min", _DEFAULT_REL_VOL)
     )
@@ -259,6 +261,9 @@ def run_fast_loop(
 
             # Spike detected → open aggTrade stream + record trigger price
             if delta >= pump_pct:
+                if dtf.is_downtrend(sym):
+                    log("FAST", f"downtrend skip {sym}")
+                    continue
                 try:
                     confirmer.add_candidate(sym)
                 except Exception as e:
@@ -383,6 +388,7 @@ def run_fast_loop(
         if cleanup_counter >= _CLEANUP_EVERY:
             try:
                 confirmer.cleanup_expired()
+                dtf.gc(set(uf.get_universe()))
             except Exception as e:
                 log("FAST", f"ERROR cleanup_expired: {type(e).__name__}: {e}")
 
