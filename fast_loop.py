@@ -127,9 +127,10 @@ def _read_confirmer_params() -> dict:
 # ---------------------------------------------------------------------------
 
 def run_fast_loop(
-    uf:         UniverseFilter,
-    stop_event: threading.Event,
+    uf:          UniverseFilter,
+    stop_event:  threading.Event,
     proxy_pool=None,
+    bot_version: str = "unknown",
 ) -> None:
     """
     PUMP_FAST detection loop.
@@ -163,7 +164,7 @@ def run_fast_loop(
     # Cleared on ALL candidate exit paths — see module docstring.
     _trigger_prices: dict = {}
 
-    log("FAST", f"loop started (v1.2 — proxy={'enabled' if proxy_pool else 'disabled'})")
+    log("FAST", f"loop started (v1.2 — proxy={'enabled' if proxy_pool else 'disabled'} — bot={bot_version})")
 
     consecutive_empty = 0
     cleanup_counter   = 0
@@ -291,14 +292,23 @@ def run_fast_loop(
                         f"tod near-miss {sym} delta={delta:.3f}% "
                         f"regime={tod['market_regime']} local_hour={tod['local_hour']}")
                     try:
-                        outcome_tracker.record(sym, "PUMP_FAST_SLEEP", price, {
-                            "delta":           round(delta, 3),
-                            "market_regime":   tod["market_regime"],
-                            "operator_window": tod["operator_window"],
-                            "local_hour":      tod["local_hour"],
-                            "utc_hour":        tod["utc_hour"],
-                            "operator_sleep":  True,
-                        })
+                        outcome_tracker.record(
+                            symbol           = sym,
+                            rule             = "PUMP_FAST",
+                            signal_kind      = "near_miss",
+                            decision         = "blocked",
+                            price_alert      = price,
+                            extras           = {
+                                "delta":           round(delta, 3),
+                                "market_regime":   tod["market_regime"],
+                                "operator_window": tod["operator_window"],
+                                "local_hour":      tod["local_hour"],
+                                "utc_hour":        tod["utc_hour"],
+                                "operator_sleep":  True,
+                            },
+                            rejection_reason = "operator_sleep",
+                            bot_version      = bot_version,
+                        )
                     except Exception as e:
                         log("FAST", f"ERROR outcome_tracker near-miss {sym}: {type(e).__name__}: {e}")
                     continue
@@ -414,7 +424,15 @@ def run_fast_loop(
             for sym, alert_str, alert_price, alert_extras in confirmed_alerts:
                 tg_send(alert_str)
                 try:
-                    outcome_tracker.record(sym, "PUMP_FAST", alert_price, alert_extras)
+                    outcome_tracker.record(
+                        symbol      = sym,
+                        rule        = "PUMP_FAST",
+                        signal_kind = "alert",
+                        decision    = "sent",
+                        price_alert = alert_price,
+                        extras      = alert_extras,
+                        bot_version = bot_version,
+                    )
                 except Exception as e:
                     log("FAST", f"ERROR outcome_tracker.record {sym}: {type(e).__name__}: {e}")
                 mark_cooldown(sym, "pump_fast")

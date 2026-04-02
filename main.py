@@ -250,6 +250,7 @@ def _make_fast_thread(uf: UniverseFilter, proxy_pool=None) -> threading.Thread:
     return threading.Thread(
         target=run_fast_loop,
         args=(uf, _stop_event, proxy_pool),
+        kwargs={"bot_version": BOT_VER},
         daemon=True,
         name="fast-loop",
     )
