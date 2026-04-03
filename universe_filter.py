@@ -299,7 +299,7 @@ def build_universe(
     }
 
     # Step 1: exclude perps
-    candidates = spot_symbols - perp_symbols
+    candidates = spot_symbols  # perp filter PAUSED (DC-UF-01)
     counters["after_perp"] = len(candidates)
 
     # Step 2: volume range filter
