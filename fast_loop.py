@@ -77,6 +77,9 @@ from universe_filter import UniverseFilter
 from volume_filter import RelativeVolumeFilter
 from downtrend_filter import DowntrendFilter
 import time_gate
+import dataset_capture
+from dataset_capture import CandidateSnapshot
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Constants — defaults used when config key is missing
@@ -784,6 +787,50 @@ def run_fast_loop(
                     _trigger_prices.pop(sym, None)
                     ms.on_done(price, now_ts)
                     continue
+
+            # ── Dataset capture (Fase 1 — DC-DATASET-02) ─────────────────
+            # Capturar TODOS los candidatos que llegan a confirming,
+            # incluyendo los rechazados por entry_gate (DC-DATASET-02).
+            # Fail-open: cualquier error loggea y no interrumpe el loop.
+            try:
+                _cap_start   = time.monotonic()          # primero — mide latencia real
+                _tod_now     = time_gate.evaluate_now()
+                _timing      = ms.timing_extras()
+                _conf_state  = confirmer.debug_state(sym) or {}
+                _buy_ratio   = _conf_state.get("buy_ratio")  # None si no disponible (N6)
+
+                _snap = CandidateSnapshot(
+                    symbol              = sym,
+                    detector_version    = bot_version,
+                    config_snapshot     = cfg("rules.fast_ts", {}),
+                    t_trigger           = (
+                        datetime.fromtimestamp(ms.trigger_ts, tz=timezone.utc)
+                        if ms.trigger_ts > 0 else None
+                    ),
+                    t_confirm           = datetime.fromtimestamp(now_ts, tz=timezone.utc),
+                    stage_pct           = gate_result_dict.get("stage_pct"),
+                    delta_pct           = round(delta, 3),
+                    t_build_ms          = _timing.get("t_build_ms"),
+                    t_confirm_ms        = _timing.get("t_confirm_ms"),
+                    move_start_price    = _timing.get("move_start_price"),
+                    noise_at_start      = _timing.get("noise_at_start"),
+                    peak_since_start    = _timing.get("peak_since_start"),
+                    cusum_at_trigger    = _timing.get("cusum_at_trigger"),
+                    cusum_shadow_pass   = _timing.get("cusum_shadow_pass"),
+                    rel_vol             = round(rel_vol, 4),
+                    confirm_ratio       = (round(_buy_ratio, 4) if _buy_ratio is not None else None),
+                    n_trades            = _conf_state.get("n_events"),
+                    utc_hour            = _tod_now.get("utc_hour"),
+                    market_regime       = _tod_now.get("market_regime"),
+                    operator_window     = _tod_now.get("operator_window"),
+                    entry_gate_decision = "passed" if gate_accepted else "rejected",
+                    rejection_reason    = (gate_result_dict.get("rejection_reason")
+                                          if not gate_accepted else None),
+                    capture_started_at  = _cap_start,
+                )
+                dataset_capture.capture(_snap)
+            except Exception as _dce:
+                log("FAST", f"WARN dataset_capture {sym}: {type(_dce).__name__}: {_dce}")
 
             if not gate_accepted:
                 log("FAST",
