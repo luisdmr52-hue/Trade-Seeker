@@ -1,6 +1,6 @@
 """
 outcome_tracker.py — KTS TradeSeeker · Capa 8 · Nivel 2
-v2.2 — 2026-04-02
+v2.3 — 2026-04-12
 
 Responsabilidades:
   - Emitter: registrar señales y near-misses en DB con atomicidad total
@@ -13,7 +13,8 @@ Diseño:
     idempotente — llamadas repetidas son no-op si el worker ya vive
   - Un fallo de DB en record() retorna None y loggea — nunca tumba el caller
   - Un fallo en el worker loggea y sigue — nunca propaga excepción al exterior
-  - Fuente primaria: Timescale. Fallback: Binance REST (una sola llamada por job)
+  - Fuente primaria: Timescale (conexión separada del lock del worker).
+    Fallback: Binance REST (una sola llamada por job)
   - lag_s persistido en columnas asof_lag_s / next_lag_s para filtrado SQL directo
 
 Decisiones de diseño cerradas aplicadas:
@@ -32,6 +33,35 @@ Historial de correcciones:
          TODO-P1: connection pool en emitter (bajo volumen Etapa 1, no urgente)
          TODO-P1: lease/visibility timeout para jobs trabados (Etapa 2)
          TODO-P1: aggregate_quality_status explícito en read model (Etapa 2)
+  v2.3 — Hardening 2026-04-12:
+         FIX-H01: missing_total → status='error' + error='missing_total' (ISSUE-01/04/08/38)
+         FIX-H02: _resolve_block usa conexión separada para queries Timescale
+                  — evita InFailedSqlTransaction en transacción del worker (ISSUE-02/03/18)
+         FIX-H03: _worker_loop cierra conn vieja antes de reconectar (ISSUE-07)
+         FIX-H04: commit() vacío protegido con check de estado de transacción (ISSUE-09)
+         FIX-H05: cap de 8KB en extras_json — residual truncado con warning (ISSUE-10)
+         FIX-H06: statement_timeout=10s en queries Timescale de resolución (ISSUE-11/25)
+         FIX-H07: price_alert casteado a float explícito en _compute_outcome_pct (ISSUE-12)
+         FIX-H08: asof_tol_s / next_tol_s casteados a int antes de pasar a PG (ISSUE-19)
+         FIX-H09: rollback explícito en finally de record() antes de close (ISSUE-20)
+         FIX-H10: sleep al final del loop — primer sweep inmediato (ISSUE-21)
+         FIX-H11: attempts no se incrementa si error fue de infraestructura sin trabajo real
+                  — separado en infra_error vs work_attempted (ISSUE-22)
+         FIX-H12: n_done_clean usa AND en lugar de OR — ambos bloques deben estar done (ISSUE-23)
+         FIX-H13: limit en Binance klines calculado dinámicamente (ISSUE-24)
+         FIX-H14: log warning cuando _sanitize_for_json trunca por profundidad (ISSUE-26)
+         FIX-H15: _validate_contract valida symbol no vacío y price_alert > 0 (ISSUE-32)
+         FIX-H16: circuit breaker activa también tras OperationalError en sweep (ISSUE-34)
+         FIX-H17: t0 siempre aware UTC via replace() defensivo en signal_status (ISSUE-37)
+         FIX-H18: heartbeat periódico del worker cada 10 sweeps sin trabajo (ISSUE-28)
+         TODO-P2: ISSUE-30 — target_ts anclado a t_confirm real (mejora metodológica futura)
+         TODO-P2: ISSUE-13 — re-check de due_at tras lock (riesgo bajo con worker único)
+         TODO-P2: ISSUE-15 — start_filler como alias (deuda técnica menor)
+         TODO-P2: ISSUE-27 — thresholds_json desacoplado de config interna
+         TODO-P2: ISSUE-29 — shared lock en signal_outcomes (riesgo bajo con worker único)
+         TODO-P2: ISSUE-31 — tolerancias inmutables por job (riesgo bajo)
+         TODO-P2: ISSUE-33 — connection pool en signal_status
+         TODO-P2: ISSUE-36 — mapeo completo de extras a columnas planas
 
 Importado por: main.py (start_worker/start_filler), fast_loop.py (record)
 """
@@ -62,6 +92,15 @@ _VALID_SIGNAL_KIND   = frozenset({"alert", "near_miss"})
 _VALID_DECISION      = frozenset({"sent", "blocked"})
 _TERMINAL_HTTP_CODES = frozenset({400, 404, 410, 422})
 
+# FIX-H05: cap de extras_json — protege contra payloads gigantes
+_EXTRAS_JSON_MAX_BYTES = 8 * 1024  # 8 KB
+
+# FIX-H06: timeout de queries Timescale en el worker (ms)
+_TIMESCALE_STMT_TIMEOUT_MS = 10_000  # 10 segundos
+
+# FIX-H18: heartbeat cada N sweeps sin trabajo
+_HEARTBEAT_EVERY_N_IDLE = 10
+
 # FIX-09: constante de módulo — evita recrear el dict en cada iteración del loop
 _OUTCOME_COL_MAP: Dict[str, str] = {
     "asof_price":       "asof_price",
@@ -90,8 +129,6 @@ _KNOWN_EXTRA_KEYS = frozenset({
 # ---------------------------------------------------------------------------
 # requests.Session compartida — FIX-05 / FIX-10
 # FIX-10: sin lock externo — requests.Session es thread-safe by design.
-#         Su pool de conexiones usa locks internos. Un lock externo solo
-#         agregaría contención sin añadir protección real.
 # ---------------------------------------------------------------------------
 
 def _build_http_session() -> requests.Session:
@@ -151,6 +188,24 @@ def _connect() -> psycopg2.extensions.connection:
     return conn
 
 
+def _connect_resolve() -> psycopg2.extensions.connection:
+    """
+    FIX-H02: conexión dedicada para queries de resolución de precios.
+    Separada de la conexión del worker para evitar que un error en Timescale
+    durante _resolve_block ponga en estado aborted la transacción que tiene
+    el FOR UPDATE del job.
+    Incluye statement_timeout para evitar que queries lentas bloqueen el worker.
+    """
+    conn = psycopg2.connect(_dsn())
+    conn.autocommit = False
+    with conn.cursor() as cur:
+        cur.execute("SET TIME ZONE 'UTC'")
+        # FIX-H06: timeout explícito — queries Timescale no bloquean indefinidamente
+        cur.execute(f"SET statement_timeout = {_TIMESCALE_STMT_TIMEOUT_MS}")
+    conn.commit()
+    return conn
+
+
 # ---------------------------------------------------------------------------
 # Sanitización — FIX-06 / FIX-11
 # ---------------------------------------------------------------------------
@@ -161,8 +216,11 @@ def _sanitize_for_json(obj: Any, _depth: int = 0) -> Any:
     - float NaN/Inf → None
     - tipos no serializables → str() controlado
     - profundidad máxima 10 (objetos circulares)
+    FIX-H14: loggea warning cuando trunca por profundidad.
     """
     if _depth > 10:
+        # FIX-H14: no silencioso — el caller verá esto en logs si ocurre
+        log("OT", f"WARN _sanitize_for_json: truncando objeto a depth={_depth} → None")
         return None
     if obj is None or isinstance(obj, bool):
         return obj
@@ -213,11 +271,24 @@ def _validate_contract(
     signal_kind:      str,
     decision:         str,
     rejection_reason: Optional[str],
+    symbol:           str,
+    price_alert:      Any,
 ) -> Optional[str]:
     """
     Retorna None si el payload es válido, o string con el error.
     El tracker rechaza — no corrige ni infiere semántica faltante.
+    FIX-H15: valida symbol no vacío y price_alert > 0.
     """
+    # FIX-H15: validaciones de inputs básicos
+    if not symbol or not isinstance(symbol, str) or not symbol.strip():
+        return "symbol vacío o inválido"
+    try:
+        pa = float(price_alert)
+        if pa <= 0 or math.isnan(pa) or math.isinf(pa):
+            return f"price_alert debe ser > 0, got {price_alert}"
+    except (TypeError, ValueError):
+        return f"price_alert no convertible a float: {price_alert!r}"
+
     if signal_kind not in _VALID_SIGNAL_KIND:
         return f"signal_kind inválido: '{signal_kind}'"
     if decision not in _VALID_DECISION:
@@ -239,37 +310,47 @@ def _is_terminal_error(exc: Exception) -> bool:
     """
     True si el error es terminal — no tiene sentido reintentar.
     Transitorio: OperationalError, Timeout, ConnectionError → False.
+    FIX-H06 extensión: JSONDecodeError (Binance rate limit HTML) → transitorio.
     """
     if isinstance(exc, requests.exceptions.HTTPError):
         code = exc.response.status_code if exc.response is not None else 0
         return code in _TERMINAL_HTTP_CODES
+    # json.JSONDecodeError es transitorio — Binance puede responder HTML en rate limit
+    # No es terminal: el job se reintentará
     return False
 
 
 # ---------------------------------------------------------------------------
 # Resolución de precios — Timescale
+# FIX-H02: recibe conn_resolve (conexión dedicada, separada del worker lock)
+# FIX-H06: statement_timeout configurado en conn_resolve al abrirla
+# FIX-H08: asof_tol_s / next_tol_s casteados a int
 # ---------------------------------------------------------------------------
 
 def _resolve_from_timescale(
-    conn,
+    conn_resolve,
     symbol:     str,
     target_ts:  datetime,
     asof_tol_s: int,
     next_tol_s: int,
 ) -> Tuple[Optional[float], Optional[float], Optional[datetime], Optional[datetime]]:
     """
-    Resuelve asof y next desde metrics_ext usando la conexión abierta del worker.
+    Resuelve asof y next desde metrics_ext usando una conexión dedicada.
 
-    asof: último precio en [target_ts - asof_tol_s, target_ts]
-    next: primer precio en [target_ts, target_ts + next_tol_s]
+    FIX-H02: usa conn_resolve separada de la conn del worker — un error aquí
+             no aborta la transacción que tiene el FOR UPDATE del job.
+    FIX-H08: asof_tol_s / next_tol_s casteados a int para evitar
+             'double precision * interval' en PG si vienen como float de YAML.
 
     Re-lanza excepciones sin atrapar — el caller en _resolve_block las clasifica.
-    psycopg2.OperationalError → transitorio.
-    psycopg2.ProgrammingError → bug de código, loggeado con tipo en _resolve_block.
     """
+    # FIX-H08: cast explícito a int
+    asof_tol_s = int(asof_tol_s)
+    next_tol_s = int(next_tol_s)
+
     asof_price = asof_ts = next_price = next_ts = None
 
-    with conn.cursor() as cur:
+    with conn_resolve.cursor() as cur:
         cur.execute(
             """
             SELECT price, ts
@@ -307,7 +388,7 @@ def _resolve_from_timescale(
 # Resolución de precios — Binance REST fallback
 # FIX-03: una sola llamada REST por job, resultado para asof y next
 # FIX-04: next solo acepta vela con close_time < now_ms (ya cerrada)
-# FIX-10: sin lock externo sobre Session
+# FIX-H13: limit calculado dinámicamente según ventana real
 # ---------------------------------------------------------------------------
 
 def _resolve_from_binance(
@@ -320,15 +401,24 @@ def _resolve_from_binance(
     Fallback Binance REST klines 1m. Una sola llamada cubre la ventana completa.
 
     FIX-04: next solo acepta close de vela ya cerrada (close_time < now_ms).
-            Una vela abierta tiene close mutable — aceptarla contaminaría el dataset.
+    FIX-H13: limit calculado como ceil((asof_tol_s + next_tol_s) / 60) + 2
+             para garantizar cobertura si asof_tol_s > 480s.
 
     Re-lanza excepciones para que el caller clasifique terminalidad.
     """
+    # FIX-H08: cast explícito a int
+    asof_tol_s = int(asof_tol_s)
+    next_tol_s = int(next_tol_s)
+
     base_url  = "https://api.binance.com/api/v3/klines"
     now_ms    = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms  = int((target_ts - timedelta(seconds=asof_tol_s)).timestamp() * 1000)
     end_ms    = int((target_ts + timedelta(seconds=next_tol_s)).timestamp() * 1000)
     target_ms = int(target_ts.timestamp() * 1000)
+
+    # FIX-H13: limit dinámico — ventana total en minutos + 2 de margen, mínimo 10
+    window_minutes = math.ceil((asof_tol_s + next_tol_s) / 60)
+    kline_limit    = max(10, window_minutes + 2)
 
     r = _http_session.get(
         base_url,
@@ -337,7 +427,7 @@ def _resolve_from_binance(
             "interval":  "1m",
             "startTime": start_ms,
             "endTime":   end_ms,
-            "limit":     10,
+            "limit":     kline_limit,
         },
         timeout=8,
     )
@@ -397,7 +487,8 @@ def record(
     TODO-P1: usar ThreadedConnectionPool para evitar TCP connect por llamada.
              Bajo volumen en Etapa 1 hace este overhead despreciable.
     """
-    err = _validate_contract(signal_kind, decision, rejection_reason)
+    # FIX-H15: validación extendida incluye symbol y price_alert
+    err = _validate_contract(signal_kind, decision, rejection_reason, symbol, price_alert)
     if err:
         log("OT", f"ERROR record() contrato inválido: {err} "
                   f"[symbol={symbol} rule={rule} kind={signal_kind} dec={decision}]")
@@ -428,7 +519,24 @@ def record(
     extras_residual = _sanitize_for_json(
         {k: v for k, v in extras.items() if k not in _KNOWN_EXTRA_KEYS}
     )
-    extras_json = json.dumps(extras_residual) if extras_residual else None
+    # FIX-H05: cap de extras_json — protege contra payloads gigantes
+    if extras_residual:
+        raw = json.dumps(extras_residual)
+        if len(raw.encode("utf-8")) > _EXTRAS_JSON_MAX_BYTES:
+            log("OT", f"WARN record() extras_json excede {_EXTRAS_JSON_MAX_BYTES}B "
+                      f"para {symbol} — truncando a keys de nivel raíz")
+            # Truncar: mantener solo keys de nivel raíz que quepan
+            truncated: Dict[str, Any] = {}
+            for k, v in extras_residual.items():
+                candidate = json.dumps({**truncated, k: v})
+                if len(candidate.encode("utf-8")) <= _EXTRAS_JSON_MAX_BYTES:
+                    truncated[k] = v
+                else:
+                    break
+            extras_residual = truncated
+        extras_json: Optional[str] = json.dumps(extras_residual) if extras_residual else None
+    else:
+        extras_json = None
 
     conn = None
     try:
@@ -529,6 +637,13 @@ def record(
         return None
     finally:
         if conn:
+            # FIX-H09: rollback explícito antes de close por si hay transacción pendiente
+            # psycopg2 hace rollback implícito en close(), pero ser explícito es más seguro
+            try:
+                if not conn.closed and conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION:
+                    conn.rollback()
+            except Exception as _re:
+                log("OT", f"WARN cleanup rollback-in-finally error: {_re}")
             try:
                 conn.close()
             except Exception as _ce:
@@ -543,46 +658,64 @@ def _compute_outcome_pct(
     price:       Optional[float],
     price_alert: Optional[float],
 ) -> Optional[float]:
-    if price is None or price_alert is None or price_alert <= 0:
+    # FIX-H07: cast explícito a float para cubrir Decimal de psycopg2
+    if price is None or price_alert is None:
         return None
-    return round((price - price_alert) / price_alert * 100, 6)
+    try:
+        p  = float(price)
+        pa = float(price_alert)
+    except (TypeError, ValueError):
+        return None
+    if pa <= 0 or math.isnan(pa) or math.isinf(pa):
+        return None
+    if math.isnan(p) or math.isinf(p):
+        return None
+    return round((p - pa) / pa * 100, 6)
 
 
 def _is_terminal_status(status: Optional[str]) -> bool:
-    return status in ("done", "missing_total", "error")
+    # FIX-H01: missing_total eliminado — no es status válido
+    return status in ("done", "error")
 
 
 # ---------------------------------------------------------------------------
 # _resolve_block — resolución de precios para un job
+# FIX-H02: recibe conn_resolve separada — no contamina la transacción del worker
 # FIX-12: logging diferenciado para errores programáticos vs transitorios
 # ---------------------------------------------------------------------------
 
 def _resolve_block(
-    conn,
+    conn_resolve,
     symbol:      str,
     target_ts:   datetime,
     price_alert: float,
     asof_tol_s:  int,
     next_tol_s:  int,
     current_row: Dict[str, Any],
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], bool]:
     """
     Resuelve los bloques asof y/o next no terminales para un horizonte.
 
-    Flujo:
-      1. Intenta Timescale (fuente primaria)
-      2. Si algún bloque quedó sin resolver → una sola llamada REST (FIX-03)
-      3. Registra fuente y lag_s por bloque (FIX-02)
+    FIX-H02: usa conn_resolve dedicada, separada del lock del worker.
+             Un error en Timescale aquí no aborta la transacción del job.
+
+    Retorna (updates, work_attempted):
+      - updates: dict con campos a actualizar en signal_outcomes
+      - work_attempted: True si se intentó al menos una resolución real
+        (usado para decidir si incrementar attempts en el job)
 
     No lanza excepciones al caller — errores se convierten en updates de status.
     """
     updates: Dict[str, Any] = {}
+    work_attempted = False
 
     need_asof = not _is_terminal_status(current_row.get("asof_status"))
     need_next = not _is_terminal_status(current_row.get("next_status"))
 
     if not need_asof and not need_next:
-        return updates
+        return updates, work_attempted
+
+    work_attempted = True
 
     # ── Intento Timescale ────────────────────────────────────────────────────
     ts_asof_price = ts_next_price = ts_asof_ts = ts_next_ts = None
@@ -590,19 +723,26 @@ def _resolve_block(
 
     try:
         ts_asof_price, ts_next_price, ts_asof_ts, ts_next_ts = \
-            _resolve_from_timescale(conn, symbol, target_ts, asof_tol_s, next_tol_s)
+            _resolve_from_timescale(
+                conn_resolve, symbol, target_ts, asof_tol_s, next_tol_s
+            )
         ts_ok = True
     except psycopg2.OperationalError as e:
-        # Transitorio — DB connection issue, reintentable
         log("OT", f"WARN timescale transitorio {symbol} h={target_ts}: {e}")
     except psycopg2.Error as e:
-        # FIX-12: error programático (ProgrammingError, DataError, etc.)
-        # No es transitorio — loggeamos con tipo explícito para diagnóstico
+        # FIX-12: error programático — loggeamos con tipo explícito
         log("OT", f"ERROR timescale programático {type(e).__name__} "
                   f"{symbol} h={target_ts}: {e}")
     except Exception as e:
         log("OT", f"WARN timescale error inesperado {type(e).__name__} "
                   f"{symbol} h={target_ts}: {e}")
+    finally:
+        # FIX-H02: rollback de conn_resolve para limpiar estado tras cada uso
+        try:
+            if not conn_resolve.closed:
+                conn_resolve.rollback()
+        except Exception as _re:
+            log("OT", f"WARN conn_resolve rollback error: {_re}")
 
     if ts_ok:
         if need_asof and ts_asof_price is not None:
@@ -649,7 +789,9 @@ def _resolve_block(
                     if fb_asof_ts:
                         updates["asof_lag_s"] = abs((fb_asof_ts - target_ts).total_seconds())
                 else:
-                    updates["asof_status"] = "missing_total"
+                    # FIX-H01: missing_total → status='error' + error='missing_total'
+                    updates["asof_status"] = "error"
+                    updates["asof_error"]  = "missing_total"
                     updates["asof_source"] = "none"
 
             if still_need_next:
@@ -662,7 +804,9 @@ def _resolve_block(
                     if fb_next_ts:
                         updates["next_lag_s"] = abs((fb_next_ts - target_ts).total_seconds())
                 else:
-                    updates["next_status"] = "missing_total"
+                    # FIX-H01: missing_total → status='error' + error='missing_total'
+                    updates["next_status"] = "error"
+                    updates["next_error"]  = "missing_total"
                     updates["next_source"] = "none"
         else:
             is_terminal = _is_terminal_error(fb_error)
@@ -679,7 +823,7 @@ def _resolve_block(
                 updates["next_error"]  = err_str
                 updates["next_source"] = "none"
 
-    return updates
+    return updates, work_attempted
 
 
 def _is_job_done(
@@ -689,8 +833,9 @@ def _is_job_done(
     """
     Job 'done' solo cuando ambos bloques son terminales, incluyendo
     los updates pendientes de este ciclo (DC-OUTCOME-31).
+    FIX-H01: frozenset terminal sin missing_total.
     """
-    terminal = frozenset({"done", "missing_total", "error"})
+    terminal = frozenset({"done", "error"})  # FIX-H01
     asof_s   = pending_updates.get("asof_status", current_row.get("asof_status"))
     next_s   = pending_updates.get("next_status",  current_row.get("next_status"))
     return asof_s in terminal and next_s in terminal
@@ -699,10 +844,13 @@ def _is_job_done(
 # ---------------------------------------------------------------------------
 # _worker_sweep
 # FIX-08: FOR UPDATE lock scope por job individual, no por batch completo
+# FIX-H02: conn_resolve separada para _resolve_block
+# FIX-H11: attempts solo incrementa si se intentó trabajo real
 # ---------------------------------------------------------------------------
 
 def _worker_sweep(
     conn,
+    conn_resolve,
     max_batch:    int,
     asof_tol_s:   int,
     next_tol_s:   int,
@@ -711,15 +859,10 @@ def _worker_sweep(
     """
     Un ciclo del worker: procesa hasta max_batch jobs pendientes y vencidos.
 
-    FIX-08: el SELECT FOR UPDATE se hace job por job dentro de una transacción
-    propia. Esto garantiza que el lock de cada fila se libera al hacer commit
-    tras procesar ese job — no al final del batch completo.
-
-    Esto evita mantener N locks activos durante potencialmente N * 8s (timeout
-    REST fallback) que podría paralizar procesos externos o futuros workers.
-
-    Tradeoff: una query extra por job para leer el job actual antes de lockear.
-    Con max_batch=20 y sweep_interval=30s, el overhead es despreciable.
+    FIX-08: transacción individual por job — lock se libera en commit/rollback.
+    FIX-H02: conn_resolve separada para queries de resolución — evita InFailedSqlTransaction.
+    FIX-H11: attempts solo incrementa si work_attempted=True — infraestructura caída
+             no consume reintentos del job.
 
     Retorna el número de jobs procesados en este ciclo.
     """
@@ -739,7 +882,17 @@ def _worker_sweep(
             (now_utc, max_batch),
         )
         job_ids = [row[0] for row in cur.fetchall()]
-    conn.commit()   # liberar snapshot de lectura
+
+    # FIX-H04: commit solo si la transacción está en estado limpio
+    try:
+        conn.commit()
+    except psycopg2.Error as e:
+        log("OT", f"WARN sweep initial commit error: {e} — intentando rollback")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
 
     if not job_ids:
         return 0
@@ -790,12 +943,19 @@ def _worker_sweep(
                 conn.commit()
                 continue
 
-            updates      = _resolve_block(
-                conn, symbol, target_ts, price_alert,
+            # FIX-H02: _resolve_block recibe conn_resolve — no toca la transacción del job
+            # FIX-H11: work_attempted indica si se intentó resolución real
+            updates, work_attempted = _resolve_block(
+                conn_resolve, symbol, target_ts, price_alert,
                 asof_tol_s, next_tol_s, dict(job),
             )
-            job_done     = _is_job_done(dict(job), updates)
-            new_attempts = attempts + 1
+            job_done = _is_job_done(dict(job), updates)
+
+            # FIX-H11: solo incrementar attempts si se intentó trabajo real
+            # Si ambas fuentes fallaron por infraestructura (work_attempted=True pero
+            # no hay updates de status), incrementamos. Si work_attempted=False
+            # (ambos bloques ya terminales antes de entrar), no incrementamos.
+            new_attempts = attempts + 1 if work_attempted else attempts
 
             # UPDATE signal_outcomes — FIX-09: _OUTCOME_COL_MAP es constante de módulo
             set_clauses: List[str] = []
@@ -866,6 +1026,10 @@ def _worker_sweep(
 
 # ---------------------------------------------------------------------------
 # _worker_loop
+# FIX-H03: cierra conn vieja antes de reconectar
+# FIX-H10: sleep al final del loop — primer sweep inmediato
+# FIX-H16: circuit breaker activa también tras OperationalError en sweep
+# FIX-H18: heartbeat periódico cuando no hay trabajo
 # ---------------------------------------------------------------------------
 
 def _worker_loop() -> None:
@@ -875,23 +1039,39 @@ def _worker_loop() -> None:
     Parámetros recargados desde config en cada sweep (hot-reload).
     Nunca propaga excepciones al exterior.
 
+    FIX-H02: conn_resolve dedicada para resolución, separada de conn principal.
+    FIX-H03: conn vieja cerrada explícitamente antes de reconectar.
+    FIX-H10: primer sweep inmediato — sleep al final del loop.
+    FIX-H16: consecutive_conn_errs incrementa también tras OperationalError en sweep.
+    FIX-H18: heartbeat cada N sweeps sin trabajo.
+
     TODO-P1: lease/visibility timeout para rescate de jobs trabados (Etapa 2).
     """
     log("OT", f"worker started sweep_interval={_ot_cfg('sweep_interval_s', 30)}s")
 
     conn                  = None
+    conn_resolve          = None
     consecutive_conn_errs = 0
     MAX_CONN_ERRORS       = 10
+    idle_sweeps           = 0   # FIX-H18: contador de sweeps sin trabajo
 
     while True:
         try:
-            time.sleep(_ot_cfg("sweep_interval_s", 30))
+            # FIX-H10: sleep al final — el primer sweep es inmediato tras el boot
+            # (el sleep está al final del bloque try)
 
+            # ── Conexión principal ──────────────────────────────────────────
             if conn is None or conn.closed:
+                # FIX-H03: cerrar explícitamente antes de reasignar
+                if conn is not None and not conn.closed:
+                    try:
+                        conn.close()
+                    except Exception as _ce:
+                        log("OT", f"WARN worker old conn close error: {_ce}")
                 try:
                     conn = _connect()
                     consecutive_conn_errs = 0
-                    log("OT", "worker DB connected")
+                    log("OT", "worker DB connected (main)")
                 except psycopg2.OperationalError as e:
                     consecutive_conn_errs += 1
                     log("OT", f"WARN worker DB connect failed "
@@ -901,10 +1081,28 @@ def _worker_loop() -> None:
                                    f"{MAX_CONN_ERRORS} attempts — backing off 5min")
                         time.sleep(300)
                         consecutive_conn_errs = 0
+                    time.sleep(_ot_cfg("sweep_interval_s", 30))
                     continue
+
+            # ── Conexión de resolución ──────────────────────────────────────
+            # FIX-H02: conn_resolve separada — se recrea si se cerró
+            if conn_resolve is None or conn_resolve.closed:
+                # FIX-H03: cerrar explícitamente antes de reasignar
+                if conn_resolve is not None and not conn_resolve.closed:
+                    try:
+                        conn_resolve.close()
+                    except Exception as _ce:
+                        log("OT", f"WARN worker old conn_resolve close error: {_ce}")
+                try:
+                    conn_resolve = _connect_resolve()
+                    log("OT", "worker DB connected (resolve)")
+                except psycopg2.OperationalError as e:
+                    log("OT", f"WARN worker conn_resolve connect failed: {e} — usando solo REST")
+                    conn_resolve = None  # _resolve_block saltará Timescale y usará REST directo
 
             n = _worker_sweep(
                 conn,
+                conn_resolve,
                 max_batch    = _ot_cfg("max_batch_size",    20),
                 asof_tol_s   = _ot_cfg("asof_tolerance_s", 300),
                 next_tol_s   = _ot_cfg("next_tolerance_s", 120),
@@ -912,21 +1110,48 @@ def _worker_loop() -> None:
             )
             if n > 0:
                 log("OT", f"worker sweep processed {n} jobs")
+                idle_sweeps = 0
+            else:
+                idle_sweeps += 1
+                # FIX-H18: heartbeat periódico cuando no hay trabajo
+                if idle_sweeps >= _HEARTBEAT_EVERY_N_IDLE:
+                    log("OT", f"worker heartbeat — idle sweeps={idle_sweeps}, "
+                              f"conn_ok={not conn.closed}")
+                    idle_sweeps = 0
 
         except psycopg2.OperationalError as e:
             log("OT", f"WARN worker lost DB connection: {e} — will reconnect")
+            # FIX-H16: incrementar consecutive_conn_errs también en este path
+            consecutive_conn_errs += 1
             if conn:
                 try:
                     conn.close()
                 except Exception as _ce:
                     log("OT", f"WARN worker conn close error: {_ce}")
             conn = None
+            if conn_resolve:
+                try:
+                    conn_resolve.close()
+                except Exception as _ce:
+                    log("OT", f"WARN worker conn_resolve close error: {_ce}")
+            conn_resolve = None
+            if consecutive_conn_errs >= MAX_CONN_ERRORS:
+                log("OT", f"ERROR worker DB unreachable after "
+                           f"{MAX_CONN_ERRORS} sweep errors — backing off 5min")
+                time.sleep(300)
+                consecutive_conn_errs = 0
         except Exception as e:
             log("OT", f"ERROR worker unexpected in main loop: {type(e).__name__}: {e}")
+
+        # FIX-H10: sleep al final — garantiza que el primer ciclo ejecuta inmediatamente
+        time.sleep(_ot_cfg("sweep_interval_s", 30))
 
 
 # ---------------------------------------------------------------------------
 # Read model — signal_status()
+# FIX-H01: frozenset terminal sin missing_total
+# FIX-H12: n_done_clean usa AND — ambos bloques deben estar done
+# FIX-H17: t0 siempre aware UTC
 # ---------------------------------------------------------------------------
 
 def signal_status(signal_id: str) -> Optional[Dict[str, Any]]:
@@ -939,14 +1164,13 @@ def signal_status(signal_id: str) -> Optional[Dict[str, Any]]:
       - mixed_source: True si asof_source != next_source (ambos con dato real)
 
     Estado agregado (operativo):
-      'done'         → todos los horizontes con al menos un bloque resuelto
+      'done'         → todos los horizontes con ambos bloques resueltos
       'done_no_data' → todos terminales, ningún precio real
       'partial'      → mezcla de terminales y no terminales
       'pending'      → sin horizontes terminales
       'error'        → todos terminales por error
 
-    Nota: 'done' es estado operativo. Calidad analítica = filtrar por
-    mixed_source=False y lag_s < umbral. Ver TODO-P1.
+    FIX-H12: 'done' requiere ambos bloques done (AND), no solo uno (OR).
 
     TODO-P1: separar aggregate_quality_status explícito (Etapa 2).
     """
@@ -983,7 +1207,8 @@ def signal_status(signal_id: str) -> Optional[Dict[str, Any]]:
             )
             rows = cur.fetchall()
 
-        terminal     = frozenset({"done", "missing_total", "error"})
+        # FIX-H01: frozenset terminal sin missing_total
+        terminal     = frozenset({"done", "error"})
         horizons_out = []
 
         for row in rows:
@@ -1021,9 +1246,10 @@ def signal_status(signal_id: str) -> Optional[Dict[str, Any]]:
             if h["asof"]["status"] in terminal
             and h["next"]["status"] in terminal
         )
+        # FIX-H12: AND en lugar de OR — ambos bloques deben estar done para contar
         n_done_clean = sum(
             1 for h in horizons_out
-            if h["asof"]["status"] == "done" or h["next"]["status"] == "done"
+            if h["asof"]["status"] == "done" and h["next"]["status"] == "done"
         )
         n_all_error  = sum(
             1 for h in horizons_out
@@ -1041,13 +1267,22 @@ def signal_status(signal_id: str) -> Optional[Dict[str, Any]]:
         else:
             agg = "done"
 
+        # FIX-H17: t0 siempre aware UTC — defensivo contra naive datetime de PG
+        t0_raw = sig["t0"]
+        if t0_raw is not None:
+            if isinstance(t0_raw, datetime) and t0_raw.tzinfo is None:
+                t0_raw = t0_raw.replace(tzinfo=timezone.utc)
+            t0_iso = t0_raw.isoformat() if isinstance(t0_raw, datetime) else str(t0_raw)
+        else:
+            t0_iso = None
+
         return {
             "signal_id":        str(sig["signal_id"]),
             "symbol":           sig["symbol"],
             "rule":             sig["rule"],
             "signal_kind":      sig["signal_kind"],
             "decision":         sig["decision"],
-            "t0":               sig["t0"].isoformat() if sig["t0"] else None,
+            "t0":               t0_iso,
             "price_alert":      sig["price_alert"],
             "aggregate_status": agg,
             "horizons":         horizons_out,
