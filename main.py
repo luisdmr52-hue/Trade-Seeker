@@ -309,6 +309,13 @@ def run() -> None:
         log("BOOT", "outcome_tracker started")
     except Exception as e:
         log("BOOT", f"outcome_tracker start error (non-fatal): {type(e).__name__}: {e}")
+    # Arrancar labeling worker (daemon thread interno)
+    try:
+        import labeling_worker
+        labeling_worker.start_labeler()
+        log("BOOT", "labeling_worker started")
+    except Exception as e:
+        log("BOOT", f"labeling_worker start error (non-fatal): {type(e).__name__}: {e}")
 
     _boot_ping(syms)
 
