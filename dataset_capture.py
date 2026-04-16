@@ -302,6 +302,38 @@ def _connect():
 
 
 # ---------------------------------------------------------------------------
+# BTC context enrichment -- shadow mode
+# ---------------------------------------------------------------------------
+
+def _enrich_btc_context(snap):
+    # Enriquece snap con contexto BTC del worker en shadow mode.
+    # Fail-open: si falla o no hay snapshot, los campos quedan None.
+    # Sin efecto en entry_gate_decision -- solo captura analitica.
+    try:
+        import btc_regime_worker
+        btc_snap = btc_regime_worker.get_latest_snapshot()
+        if btc_snap is None:
+            return
+        if not btc_snap.get('snapshot_observable', False):
+            return
+        raw_ts = btc_snap.get('snapshot_ts')
+        snap.btc_regime_snapshot_ts          = str(raw_ts) if raw_ts is not None else None
+        snap.btc_regime_source_lag_ms        = _safe_float(btc_snap.get('source_lag_ms'))
+        snap.btc_regime_health_status        = btc_snap.get('snapshot_health_status')
+        snap.btc_regime_worker_status        = btc_snap.get('worker_status')
+        snap.btc_stress_score_at_confirm     = _safe_float(btc_snap.get('btc_stress_score'))
+        snap.btc_trend_score_at_confirm      = _safe_float(btc_snap.get('btc_trend_score'))
+        snap.btc_volatility_score_at_confirm = _safe_float(btc_snap.get('btc_volatility_score'))
+        snap.btc_liquidity_score_at_confirm  = _safe_float(btc_snap.get('btc_liquidity_score'))
+        snap.btc_activity_score_at_confirm   = _safe_float(btc_snap.get('btc_activity_score'))
+        snap.btc_stress_state_at_confirm     = btc_snap.get('btc_stress_state')
+        snap.btc_trend_state_at_confirm      = btc_snap.get('btc_trend_state')
+    except Exception as e:
+        log('DC', 'WARN _enrich_btc_context error (non-fatal): ' + type(e).__name__ + ': ' + str(e))
+
+
+
+# ---------------------------------------------------------------------------
 # capture() — interfaz pública
 # ---------------------------------------------------------------------------
 
@@ -395,6 +427,9 @@ def capture(snap: CandidateSnapshot) -> Optional[str]:
     # ── 7. Stale mask → JSON ─────────────────────────────────────────────
     stale_mask_json = json.dumps(stale_mask) if stale_mask else None
 
+    # -- 7b. Enriquecer con contexto BTC (shadow -- fail-open) ------------
+    _enrich_btc_context(snap)
+
     # ── 8. Persistencia ──────────────────────────────────────────────────
     conn = None
     try:
@@ -460,7 +495,15 @@ def capture(snap: CandidateSnapshot) -> Optional[str]:
 
                     detector_version,        feature_version,
                     feature_set_hash,
-                    source_runtime_component, transformation_path
+                    source_runtime_component, transformation_path,
+
+                    btc_regime_snapshot_ts,
+                    btc_regime_source_lag_ms,        btc_regime_health_status,
+                    btc_regime_worker_status,
+                    btc_stress_score_at_confirm,     btc_trend_score_at_confirm,
+                    btc_volatility_score_at_confirm, btc_liquidity_score_at_confirm,
+                    btc_activity_score_at_confirm,
+                    btc_stress_state_at_confirm,     btc_trend_state_at_confirm
                 ) VALUES (
                     %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s,
@@ -468,6 +511,10 @@ def capture(snap: CandidateSnapshot) -> Optional[str]:
                     %s, %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s, %s,
+                    %s, %s,
+                    %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s, %s,
                     %s, %s
                 )
                 ON CONFLICT (event_id) DO NOTHING
@@ -494,6 +541,14 @@ def capture(snap: CandidateSnapshot) -> Optional[str]:
                     snap.detector_version,             FEATURE_VERSION,
                     feature_set_hash,
                     _SOURCE_COMPONENT,                 _TRANSFORMATION,
+
+                    snap.btc_regime_snapshot_ts,
+                    snap.btc_regime_source_lag_ms,     snap.btc_regime_health_status,
+                    snap.btc_regime_worker_status,
+                    snap.btc_stress_score_at_confirm,  snap.btc_trend_score_at_confirm,
+                    snap.btc_volatility_score_at_confirm, snap.btc_liquidity_score_at_confirm,
+                    snap.btc_activity_score_at_confirm,
+                    snap.btc_stress_state_at_confirm,  snap.btc_trend_state_at_confirm,
                 ),
             )
 

@@ -317,6 +317,14 @@ def run() -> None:
     except Exception as e:
         log("BOOT", f"labeling_worker start error (non-fatal): {type(e).__name__}: {e}")
 
+
+    try:
+        import btc_regime_worker
+        btc_regime_worker.start_worker()
+        log("BOOT", "btc_regime_worker started (shadow mode)")
+    except Exception as e:
+        log("BOOT", f"btc_regime_worker start error (non-fatal): {type(e).__name__}: {e}")
+
     _boot_ping(syms)
 
     # Arrancar fast_loop
