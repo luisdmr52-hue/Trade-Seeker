@@ -159,6 +159,21 @@ class CandidateSnapshot:
     # Si None → capture() mide desde su propio inicio (subestima latencia real).
     capture_started_at: Optional[float] = None
 
+    # -- Contexto BTC en t_confirm (Capa 6 -- shadow mode) ----------------
+    btc_regime_snapshot_ts:          Optional[str]   = None
+    btc_regime_source_lag_ms:        Optional[float] = None
+    btc_regime_health_status:        Optional[str]   = None
+    btc_regime_worker_status:        Optional[str]   = None
+    btc_stress_score_at_confirm:     Optional[float] = None
+    btc_trend_score_at_confirm:      Optional[float] = None
+    btc_volatility_score_at_confirm: Optional[float] = None
+    btc_liquidity_score_at_confirm:  Optional[float] = None
+    btc_activity_score_at_confirm:   Optional[float] = None
+    btc_stress_state_at_confirm:     Optional[str]   = None
+    btc_trend_state_at_confirm:      Optional[str]   = None
+    btc_regime_feature_ts:           Optional[str]   = None
+    btc_regime_join_lag_ms:          Optional[float] = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers internos
@@ -328,6 +343,25 @@ def _enrich_btc_context(snap):
         snap.btc_activity_score_at_confirm   = _safe_float(btc_snap.get('btc_activity_score'))
         snap.btc_stress_state_at_confirm     = btc_snap.get('btc_stress_state')
         snap.btc_trend_state_at_confirm      = btc_snap.get('btc_trend_state')
+        # btc_regime_feature_ts y join_lag (SoT Seccion 14.9)
+        raw_fts = btc_snap.get('feature_ts')
+        snap.btc_regime_feature_ts = str(raw_fts) if raw_fts is not None else None
+        if raw_fts is not None and snap.t_confirm is not None:
+            try:
+                if isinstance(raw_fts, datetime):
+                    fts = raw_fts
+                else:
+                    fts = datetime.fromisoformat(str(raw_fts).replace('Z', '+00:00'))
+                tc = snap.t_confirm
+                if tc.tzinfo is None:
+                    tc = tc.replace(tzinfo=timezone.utc)
+                if fts.tzinfo is None:
+                    fts = fts.replace(tzinfo=timezone.utc)
+                lag = (tc - fts).total_seconds() * 1000.0
+                snap.btc_regime_join_lag_ms = round(lag, 2)
+            except Exception as _je:
+                log('DC', 'WARN btc_regime_join_lag_ms calc error (non-fatal): ' + type(_je).__name__ + ': ' + str(_je))
+                snap.btc_regime_join_lag_ms = None
     except Exception as e:
         log('DC', 'WARN _enrich_btc_context error (non-fatal): ' + type(e).__name__ + ': ' + str(e))
 
@@ -503,7 +537,8 @@ def capture(snap: CandidateSnapshot) -> Optional[str]:
                     btc_stress_score_at_confirm,     btc_trend_score_at_confirm,
                     btc_volatility_score_at_confirm, btc_liquidity_score_at_confirm,
                     btc_activity_score_at_confirm,
-                    btc_stress_state_at_confirm,     btc_trend_state_at_confirm
+                    btc_stress_state_at_confirm,     btc_trend_state_at_confirm,
+                    btc_regime_feature_ts,           btc_regime_join_lag_ms
                 ) VALUES (
                     %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s,
@@ -515,6 +550,7 @@ def capture(snap: CandidateSnapshot) -> Optional[str]:
                     %s,
                     %s, %s, %s,
                     %s, %s, %s, %s, %s,
+                    %s, %s,
                     %s, %s
                 )
                 ON CONFLICT (event_id) DO NOTHING
@@ -549,6 +585,7 @@ def capture(snap: CandidateSnapshot) -> Optional[str]:
                     snap.btc_volatility_score_at_confirm, snap.btc_liquidity_score_at_confirm,
                     snap.btc_activity_score_at_confirm,
                     snap.btc_stress_state_at_confirm,  snap.btc_trend_state_at_confirm,
+                    snap.btc_regime_feature_ts,        snap.btc_regime_join_lag_ms,
                 ),
             )
 
